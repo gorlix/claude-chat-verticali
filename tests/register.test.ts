@@ -1,0 +1,190 @@
+import { expect, mock, test } from 'claude-code/testing'
+
+const composeInput = {
+  model: 'claude-sonnet-5-5',
+  promptModel: 'claude-sonnet-5-5',
+  surfaces: ['terminal'],
+  tools: [],
+  outputStyle: { name: 'default', isKeepingCodingInstructions: true },
+  traits: [],
+  sections: [],
+} as never
+
+test('/verticali with an empty registry says so', async ($, on) => {
+  mock.store(on)
+  const ran = await $.command.run({ command: 'verticali', args: '' })
+  expect(ran.text).toBe('Nessuna chat verticale registrata.')
+})
+
+test('/handoff without a topic prints usage and opens nothing', async $ => {
+  const ran = await $.command.run({ command: 'handoff', args: '  ' })
+  expect(ran.text).toContain('Uso: /handoff')
+})
+
+const vertical = {
+  slug: 'acme-42-fix', title: 'Fix ACME-42', scope: 'solo il bug 42', sessionId: 'sess-v',
+  cwd: '/tmp', model: 'sonnet', briefPath: '/tmp/b.md', status: 'active', createdAt: '2026-10-19',
+}
+
+test('a plain chat gets the general rules only', async ($, on) => {
+  mock.store(on)
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('prompt.compose', ($, e) => ({ sections: e.sections }))
+  const composed = await $.prompt.compose(composeInput)
+  const rules = composed.sections.find(s => s.id === 'chat-verticali:rules')
+  expect(rules?.text).toContain('Una chat = un verticale')
+  expect(rules?.text).not.toContain('QUESTA CHAT È VERTICALE')
+})
+
+test('a vertical chat gets its own scope in the system prompt', async ($, on) => {
+  mock.store(on, { 'v:sess-v': vertical })
+  on('session.id', () => ({ value: 'sess-v' }))
+  on('prompt.compose', ($, e) => ({ sections: e.sections }))
+  const composed = await $.prompt.compose(composeInput)
+  const own = composed.sections.find(s => s.id === 'chat-verticali:rules')
+  expect(own?.text).toContain('QUESTA CHAT È VERTICALE: «Fix ACME-42»')
+  expect(own?.text).toContain('solo il bug 42')
+})
+
+test('moving a second PACA task adds a handoff reminder', async ($, on) => {
+  mock.store(on)
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('tool.call', { tool: /update_task$/ }, () => ({ result: 'ok' }))
+
+  const first = await $.tool.call({ tool: 'mcp__paca__update_task', projectId: 'p', taskId: 'task-a', statusId: 's' })
+  expect(first.context ?? []).toEqual([])
+
+  const same = await $.tool.call({ tool: 'mcp__paca__update_task', projectId: 'p', taskId: 'task-a', statusId: 's2' })
+  expect(same.context ?? []).toEqual([])
+
+  const other = await $.tool.call({ tool: 'mcp__paca-homelab__update_task', projectId: 'p', taskId: 'task-b', statusId: 's' })
+  expect((other.context ?? []).join('\n')).toContain('diverso dal verticale')
+})
+
+// --- Pane "Verticali" (0.2.0) ---
+
+const pane = {
+  plugin: 'chat-verticali', surface: 'terminal', component: 'Pane', requestId: 'verticali', props: {},
+} as never
+const v = (id: string, over: object = {}) => ({
+  ...vertical, slug: `slug-${id}`, title: `Titolo ${id}`, sessionId: id, ...over,
+})
+const runOk = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+
+test('the pane groups verticals, shows ref, context bar and relations', async ($, on) => {
+  mock.store(on, {
+    'v:a': v('a', { pacaRef: 'HOME-16', contextPercent: 72, parentSessionId: 'main' }),
+    'v:b': v('b', { status: 'paused' }),
+    'v:c': v('c', { status: 'done', contextPercent: 90 }),
+  })
+  on('session.id', () => ({ value: 'a' }))
+  const ui = await $.ui.mount(pane)
+  expect(await ui.findAll({ type: 'Text', text: /Attive \(1\)/ })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: /In pausa \(1\)/ })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: /Chiuse \(1\)/ })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: /HOME-16/ })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: /\(questa\)/ })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: /72%/ })).not.toHaveLength(0)
+  // The done one shows no percentage; the current session has no "Vai" for itself.
+  expect(await ui.findAll({ type: 'Text', text: /90%/ })).toHaveLength(0)
+  expect(await ui.findAll({ type: 'Button', text: /Vai/ })).toHaveLength(1)
+})
+
+test('only the latest 5 closed verticals are listed', async ($, on) => {
+  const seed: Record<string, unknown> = {}
+  for (let i = 1; i <= 7; i++) seed[`v:d${i}`] = v(`d${i}`, { status: 'done', createdAt: `2026-10-0${i}` })
+  mock.store(on, seed)
+  on('session.id', () => ({ value: 'main' }))
+  const ui = await $.ui.mount(pane)
+  expect(await ui.findAll({ type: 'Text', text: /ultime 5 di 7/ })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: /slug-d7/ })).not.toHaveLength(0)
+  expect(await ui.findAll({ type: 'Text', text: /slug-d1\b/ })).toHaveLength(0)
+})
+
+test('Vai selects the tmux window of the vertical', async ($, on) => {
+  const runs: string[][] = []
+  mock.store(on, { 'v:a': v('a'), 'v:b': v('b') })
+  on('session.id', () => ({ value: 'a' }))
+  on('env.get', () => ({ value: '/tmp/tmux' }))
+  on('process.run', ($, e) => {
+    runs.push([...(e as { argv: string[] }).argv])
+    return { value: runOk }
+  })
+  const ui = await $.ui.mount(pane)
+  await ui.press({ key: 'go-b' })
+  expect(runs).toEqual([['tmux', 'select-window', '-t', 'slug-b']])
+})
+
+test('Vai on a missing window, or outside tmux, copies the resume command', async ($, on) => {
+  const copied: string[] = []
+  const toasts: string[] = []
+  let tmux = '/tmp/tmux'
+  mock.store(on, { 'v:a': v('a'), 'v:b': v('b') })
+  on('session.id', () => ({ value: 'a' }))
+  on('env.get', () => ({ value: tmux }))
+  on('process.run', () => ({ value: { ...runOk, exitCode: 1, stderr: "can't find window" } }))
+  on('ui.copy', ($, e) => {
+    copied.push((e as { text: string }).text)
+    return { value: { isCopied: true } }
+  })
+  on('ui.toast', ($, e) => {
+    toasts.push((e as { text: string }).text)
+    return { value: undefined }
+  })
+  const ui = await $.ui.mount(pane)
+  await ui.press({ key: 'go-b' })
+  expect(toasts[0]).toContain('non trovata')
+  tmux = ''
+  await ui.press({ key: 'go-b' })
+  expect(toasts[1]).toContain('Fuori da tmux')
+  expect(copied).toEqual(['claude --resume b', 'claude --resume b'])
+})
+
+// A store the test can read back: the plugin's `$.store` is not on the test's `$`.
+const spyStore = (on: Parameters<typeof mock.store>[0], seed: Record<string, unknown>) => {
+  const data = new Map(Object.entries(seed))
+  on('store.get', (_$, e) => ({ value: data.get((e as { key: string }).key) }))
+  on('store.set', (_$, e) => {
+    const { key, value } = e as { key: string; value: unknown }
+    data.set(key, JSON.parse(JSON.stringify(value)))
+    return { value: undefined }
+  })
+  on('store.delete', (_$, e) => ({ value: void data.delete((e as { key: string }).key) }))
+  on('store.keys', () => ({ value: [...data.keys()] }))
+  return data
+}
+
+test('a vertical records its context percent on session.measure; a plain chat does not', async ($, on) => {
+  const data = spyStore(on, { 'v:a': v('a') })
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('session.id', () => ({ value: 'a' }))
+  on('clock.now', () => ({ value: 1_760_000_000_000 }))
+  const measure = (percent: number, changed: ('context' | 'cost')[]) =>
+    $.session.measure({ context: { window: 200000, percent }, rateLimits: [], changed } as never)
+  await measure(55, ['cost'])
+  expect((data.get('v:a') as { contextPercent?: number }).contextPercent).toBeUndefined()
+  await measure(55, ['context'])
+  const rec = data.get('v:a') as { contextPercent?: number; contextAt?: string }
+  expect(rec.contextPercent).toBe(55)
+  expect(rec.contextAt).toContain('2025')
+})
+
+test('a chat that is not a registered vertical writes nothing on session.measure', async ($, on) => {
+  const data = spyStore(on, {})
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('session.id', () => ({ value: 'plain' }))
+  await $.session.measure({ context: { window: 200000, percent: 70 }, rateLimits: [], changed: ['context'] } as never)
+  expect([...data.keys()]).toEqual([])
+})
+
+test('/verticali opens the pane and still answers with the text', async ($, on) => {
+  const opened: string[] = []
+  mock.store(on, { 'v:a': v('a') })
+  on('ui.open', ($, e) => {
+    opened.push((e as { id: string }).id)
+    return { value: { isPlaced: true } }
+  })
+  const ran = await $.command.run({ command: 'verticali', args: '' } as never)
+  expect(opened).toEqual(['verticali'])
+  expect(ran.text).toContain('slug-a')
+})

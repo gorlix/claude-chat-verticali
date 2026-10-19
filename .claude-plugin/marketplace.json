@@ -1,0 +1,5 @@
+{
+  "name": "gorlix-chat-verticali",
+  "owner": { "name": "gorlix" },
+  "plugins": [{ "name": "chat-verticali", "source": "./" }]
+}

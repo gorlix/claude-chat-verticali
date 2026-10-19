@@ -1,0 +1,9 @@
+{
+  "name": "chat-verticali",
+  "version": "0.2.1",
+  "description": "Chat verticali: passa il contesto a una nuova chat specializzata (task PACA, argomento, funzione) in una finestra tmux, con brief, registro e ritorno del risultato.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "gorlix"
+  }
+}
