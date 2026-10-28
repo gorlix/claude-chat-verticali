@@ -228,3 +228,91 @@ test('the pane and /verticali hide the verticals of other projects', async ($, o
   const all = await $.command.run({ command: 'verticali', args: 'tutte' } as never)
   expect(all.text).toContain('slug-other')
 })
+
+// --- Closing and the link to the mother (0.3.0) ---
+
+const turnEnd = (reason = 'answer') =>
+  ({ answer: 'fatto', durationMs: 10, isAborted: reason === 'aborted', turnId: 't1', reason }) as never
+
+// A vertical with its brief on a fake fs, its mother as `mother`; `delivered` is what the send answers.
+const doneSetup = (on: Parameters<typeof mock.store>[0], opts: { delivered: boolean; pane?: string; start?: string }) => {
+  const data = spyStore(on, { 'v:a': v('a', { parentSessionId: 'mother', briefPath: '/tmp/a.md' }) })
+  const runs: string[][] = []
+  const toasts: string[] = []
+  on('session.id', () => ({ value: 'a' }))
+  on('session.usage', () => ({ value: { context: {} } }))
+  on('clock.now', () => ({ value: 1_760_000_000_000 }))
+  on('fs.read', () => ({ value: '# brief\n' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('env.get', ($, e) => {
+    const name = (e as { name: string }).name
+    return { value: name === 'TMUX_PANE' ? opts.pane : name === 'TMUX' && opts.pane ? '/tmp/tmux-1000/default,42,0' : undefined }
+  })
+  on('session.send', () => (opts.delivered ? { isDelivered: true } : { isDelivered: false, reason: 'gone' }))
+  on('ui.toast', ($, e) => ({ value: void toasts.push((e as { text: string }).text) }))
+  here(on, '/tmp', argv => {
+    runs.push(argv)
+    return argv[1] === 'display-message' ? { ...runOk, stdout: opts.start ?? '' } : runOk
+  })
+  return { data, runs, toasts }
+}
+
+test('vertical_done (done) closes its own tmux pane when the turn ends', async ($, on) => {
+  const { runs, toasts, data } = doneSetup(on, { delivered: true, pane: '%7', start: 'claude -n slug-a --session-id a ...' })
+  on('turn.complete', ($, e) => ({ text: (e as { answer: string }).answer }))
+  const ran = await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)
+  expect(ran.result).toContain('si chiude da sola')
+  expect(runs).toEqual([])
+  await $.turn.complete(turnEnd())
+  expect(runs[1]).toEqual(['tmux', 'run-shell', '-b', "sleep 5; tmux -S '/tmp/tmux-1000/default' kill-pane -t '%7'"])
+  expect(toasts[0]).toContain('si chiude tra 5s')
+  expect(data.has('close:a')).toBe(false)
+})
+
+test('vertical_done leaves alone a pane the mod did not open, and paused never closes', async ($, on) => {
+  const { runs, toasts } = doneSetup(on, { delivered: true, pane: '%3', start: 'zsh' })
+  on('turn.complete', ($, e) => ({ text: (e as { answer: string }).answer }))
+  await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)
+  await $.turn.complete(turnEnd())
+  expect(runs.some(r => r[1] === 'run-shell')).toBe(false)
+  expect(toasts[0]).toContain('/exit')
+
+  const paused = await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok', status: 'paused' } as never)
+  expect(paused.result).not.toContain('si chiude')
+})
+
+test('an interrupted turn does not close the pane yet', async ($, on) => {
+  const { runs, data } = doneSetup(on, { delivered: true, pane: '%7', start: 'claude --resume a' })
+  on('turn.complete', ($, e) => ({ text: (e as { answer: string }).answer }))
+  await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)
+  await $.turn.complete(turnEnd('aborted'))
+  expect(runs).toEqual([])
+  expect(data.get('close:a')).toBe(true)
+})
+
+test('a summary the mother cannot receive waits in her inbox', async ($, on) => {
+  const { data } = doneSetup(on, { delivered: false })
+  const ran = await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'tutto ok' } as never)
+  expect(ran.result).toContain('quando si riapre')
+  expect((data.get('inbox:mother') as string[])[0]).toContain('tutto ok')
+})
+
+test('after a /clear the children follow the mother to her new id', async ($, on) => {
+  const data = spyStore(on, {
+    'v:c1': v('c1', { parentSessionId: 'old' }),
+    'v:c2': v('c2', { parentSessionId: 'elsewhere' }),
+    'inbox:old': ['esito c0'],
+  })
+  let id = 'old'
+  on('session.id', () => ({ value: id }))
+  on('session.usage', () => ({ value: { context: {} } }))
+  on('session.end', ($, e) => ({ sessionId: (e as { sessionId: string }).sessionId }))
+  on('turn.complete', ($, e) => ({ text: (e as { answer: string }).answer }))
+  await $.session.end({ reason: 'clear', sessionId: 'old', resume: { id: 'old' } } as never)
+  id = 'new'
+  await $.turn.complete(turnEnd())
+  expect((data.get('v:c1') as { parentSessionId: string }).parentSessionId).toBe('new')
+  expect((data.get('v:c2') as { parentSessionId: string }).parentSessionId).toBe('elsewhere')
+  expect(data.get('inbox:new')).toEqual(['esito c0'])
+  expect(data.has('inbox:old')).toBe(false)
+})

@@ -59,6 +59,11 @@ const tick = atom({ plugin: 'chat-verticali', key: 'tick' } as const, 0)
 const verticalKey = (sessionId: string) => `v:${sessionId}`
 const focusKey = (sessionId: string) => `focus:${sessionId}`
 const warnKey = (sessionId: string) => `ctxwarn:${sessionId}`
+// Summaries a vertical could not deliver, kept for its mother's next opening.
+const inboxKey = (sessionId: string) => `inbox:${sessionId}`
+// Set by vertical_done: close this vertical's tmux pane when the turn ends.
+const closeKey = (sessionId: string) => `close:${sessionId}`
+const CLOSE_DELAY_S = 5
 
 const slugify = (text: string) =>
   text
@@ -245,18 +250,76 @@ async function finishVertical(
 
   let parentNote = 'nessuna chat madre registrata'
   if (v.parentSessionId) {
-    const sent = await $.session.send({
-      to: { sessionId: v.parentSessionId },
-      text: `[chat verticale «${v.slug}» — ${status}]\n\n${input.summary.trim()}\n\nBrief completo: ${v.briefPath}`,
-    })
-    parentNote = sent.isDelivered
-      ? 'riepilogo inviato alla chat madre'
-      : `chat madre non raggiunta (${sent.reason}): il riepilogo resta nel brief`
+    const text = `[chat verticale «${v.slug}» — ${status}]\n\n${input.summary.trim()}\n\nBrief completo: ${v.briefPath}`
+    const sent = await $.session.send({ to: { sessionId: v.parentSessionId }, text })
+    if (sent.isDelivered) parentNote = 'riepilogo inviato alla chat madre'
+    else {
+      await enqueue($, inboxKey(v.parentSessionId), text)
+      parentNote = `chat madre non raggiunta (${sent.reason}): il riepilogo le arriverà quando si riapre`
+    }
   }
   const paca = v.pacaTaskId
     ? ` Ora aggiungi il riepilogo come commento al task PACA ${v.pacaRef ?? v.pacaTaskId} (\`${v.pacaTaskId}\`) e aggiorna lo stato secondo la skill paca-workflow del repo.`
     : ''
-  return `Verticale «${v.slug}» segnata ${status}; ${parentNote}.${paca}`
+  let close = ''
+  if (status === 'done') {
+    await $.store.set(closeKey(v.sessionId), true)
+    close = ' A fine turno la finestra tmux di questa chat si chiude da sola: completa ora, in questo turno, ciò che resta (PACA compreso) e non fare domande all\'utente.'
+  }
+  return `Verticale «${v.slug}» segnata ${status}; ${parentNote}.${paca}${close}`
+}
+
+// Queues a summary in a session's inbox (store, read by that session later).
+async function enqueue($: EngineInterface, key: string, text: string) {
+  const queued = ((await $.store.get(key)) as string[] | undefined) ?? []
+  await $.store.set(key, [...queued, text])
+}
+
+// Delivers the summaries queued for this session while it was closed.
+async function deliverInbox($: EngineInterface) {
+  const key = inboxKey(await $.session.id())
+  const queued = (await $.store.get(key)) as string[] | undefined
+  if (!queued?.length) return
+  await $.store.delete(key)
+  for (const text of queued) {
+    await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
+  }
+  $.ui.toast(`Arrivati ${queued.length} esiti di chat verticali`)
+}
+
+// After a /clear the session goes on under a new id: move the links (children's
+// mother, this session's own record, its inbox) from the old id to the new one.
+async function relink($: EngineInterface, oldId: string) {
+  const newId = await $.session.id()
+  if (newId === oldId) return false
+  for (const v of await allVerticals($)) {
+    if (v.parentSessionId === oldId) await $.store.set(verticalKey(v.sessionId), { ...v, parentSessionId: newId })
+  }
+  const own = (await $.store.get(verticalKey(oldId))) as Vertical | undefined
+  if (own) {
+    await $.store.delete(verticalKey(oldId))
+    await $.store.set(verticalKey(newId), { ...own, sessionId: newId })
+  }
+  const queued = (await $.store.get(inboxKey(oldId))) as string[] | undefined
+  if (queued) {
+    await $.store.delete(inboxKey(oldId))
+    for (const text of queued) await enqueue($, inboxKey(newId), text)
+  }
+  return true
+}
+
+// Closes this vertical's tmux pane, a few seconds on so the last answer can be
+// read; only a pane the mod opened for it (its start command names the session).
+async function closePane($: EngineInterface, v: Vertical) {
+  const pane = await $.env.get('TMUX_PANE')
+  if (!pane) return false
+  const ran = await $.process.run(['tmux', 'display-message', '-p', '-t', pane, '#{pane_start_command}'])
+  if (ran.exitCode !== 0 || !ran.stdout.includes(v.sessionId)) return false
+  // The tmux server runs the kill: it outlives this process. Same socket as ours.
+  const socket = ((await $.env.get('TMUX')) ?? '').split(',')[0]
+  const tmux = socket ? `tmux -S '${socket}'` : 'tmux'
+  const killed = await $.process.run(['tmux', 'run-shell', '-b', `sleep ${CLOSE_DELAY_S}; ${tmux} kill-pane -t '${pane}'`])
+  return killed.exitCode === 0
 }
 
 // Go to a vertical: select its tmux window; when the window is gone (or we are
@@ -304,6 +367,9 @@ function rulesSection(v: Vertical | undefined): string {
   ].filter(Boolean).join('\n')
 }
 
+// The id a /clear left behind, until the poll has moved its links.
+let clearedFrom: string | undefined
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.tool.register({
@@ -349,8 +415,13 @@ export const register: Register = on => {
     if (v) $.ui.status(`⟂ ${v.slug}`)
 
     // Pane: opened only where verticals are active; refreshed when the registry changes.
+    // The same poll moves the links after a /clear and delivers queued summaries.
     let signature = ''
     $.clock.every(POLL_MS, () => {
+      void (async () => {
+        if (clearedFrom && (await relink($, clearedFrom))) clearedFrom = undefined
+        await deliverInbox($)
+      })().catch(() => undefined)
       void projectVerticals($)
         .then(list => {
           const now = JSON.stringify(list)
@@ -361,6 +432,14 @@ export const register: Register = on => {
         .catch(() => undefined)
     })
     if (await hasActiveVerticals($)) void openPane($).catch(() => undefined)
+    await deliverInbox($).catch(() => undefined)
+    return next(e)
+  })
+
+  // A /clear ends the conversation and goes on under a new id, with no
+  // session.start: remember the old id, the poll relinks once the id changed.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') clearedFrom = e.sessionId
     return next(e)
   })
 
@@ -422,12 +501,21 @@ export const register: Register = on => {
     return { ...ran, context: [...(ran.context ?? []), note] }
   }).catch(($, e, next) => next(e))
 
-  // Trigger: context window over the thresholds.
+  // vertical_done (done): close the tmux pane once the turn that called it ends.
+  // Otherwise: warn when the context window passes the thresholds.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
+    if (clearedFrom && (await relink($, clearedFrom).catch(() => false))) clearedFrom = undefined
+    const sessionId = await $.session.id()
+    if (!e.agentId && e.reason === 'answer' && (await $.store.get(closeKey(sessionId)))) {
+      await $.store.delete(closeKey(sessionId))
+      const v = await thisVertical($)
+      if (v && (await closePane($, v).catch(() => false))) $.ui.toast(`Verticale chiusa: la finestra si chiude tra ${CLOSE_DELAY_S}s`)
+      else $.ui.toast('Verticale chiusa: esci con /exit')
+      return done
+    }
     const percent = (await $.session.usage()).context.percent
     if (percent === undefined) return done
-    const sessionId = await $.session.id()
     const warned = Number((await $.store.get(warnKey(sessionId))) ?? 0)
     const level = [...CONTEXT_THRESHOLDS].reverse().find(t => percent >= t)
     if (!level || level <= warned) return done
