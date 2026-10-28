@@ -10,9 +10,23 @@ const composeInput = {
   sections: [],
 } as never
 
+const notGit = { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false }
+
+// The session's folder, outside git: a vertical's project is then its own cwd.
+// `run` answers any other command (tmux in the Vai tests).
+const here = (on: Parameters<typeof mock.store>[0], cwd = '/tmp', run?: (argv: string[]) => unknown) => {
+  on('session.cwd', () => ({ value: cwd }))
+  on('process.run', ($, e) => {
+    const argv = [...(e as { argv: string[] }).argv]
+    return { value: argv[0] === 'git' ? notGit : run?.(argv) }
+  })
+}
+
 test('/verticali with an empty registry says so', async ($, on) => {
   mock.store(on)
-  const ran = await $.command.run({ command: 'verticali', args: '' })
+  on('session.id', () => ({ value: 'sess-1' }))
+  here(on)
+  const ran = await $.command.run({ command: 'verticali', args: 'tutte' })
   expect(ran.text).toBe('Nessuna chat verticale registrata.')
 })
 
@@ -78,6 +92,7 @@ test('the pane groups verticals, shows ref, context bar and relations', async ($
     'v:c': v('c', { status: 'done', contextPercent: 90 }),
   })
   on('session.id', () => ({ value: 'a' }))
+  here(on)
   const ui = await $.ui.mount(pane)
   expect(await ui.findAll({ type: 'Text', text: /Attive \(1\)/ })).toHaveLength(1)
   expect(await ui.findAll({ type: 'Text', text: /In pausa \(1\)/ })).toHaveLength(1)
@@ -95,6 +110,7 @@ test('only the latest 5 closed verticals are listed', async ($, on) => {
   for (let i = 1; i <= 7; i++) seed[`v:d${i}`] = v(`d${i}`, { status: 'done', createdAt: `2026-10-0${i}` })
   mock.store(on, seed)
   on('session.id', () => ({ value: 'main' }))
+  here(on)
   const ui = await $.ui.mount(pane)
   expect(await ui.findAll({ type: 'Text', text: /ultime 5 di 7/ })).toHaveLength(1)
   expect(await ui.findAll({ type: 'Text', text: /slug-d7/ })).not.toHaveLength(0)
@@ -106,9 +122,9 @@ test('Vai selects the tmux window of the vertical', async ($, on) => {
   mock.store(on, { 'v:a': v('a'), 'v:b': v('b') })
   on('session.id', () => ({ value: 'a' }))
   on('env.get', () => ({ value: '/tmp/tmux' }))
-  on('process.run', ($, e) => {
-    runs.push([...(e as { argv: string[] }).argv])
-    return { value: runOk }
+  here(on, '/tmp', argv => {
+    runs.push(argv)
+    return runOk
   })
   const ui = await $.ui.mount(pane)
   await ui.press({ key: 'go-b' })
@@ -122,7 +138,7 @@ test('Vai on a missing window, or outside tmux, copies the resume command', asyn
   mock.store(on, { 'v:a': v('a'), 'v:b': v('b') })
   on('session.id', () => ({ value: 'a' }))
   on('env.get', () => ({ value: tmux }))
-  on('process.run', () => ({ value: { ...runOk, exitCode: 1, stderr: "can't find window" } }))
+  here(on, '/tmp', () => ({ ...runOk, exitCode: 1, stderr: "can't find window" }))
   on('ui.copy', ($, e) => {
     copied.push((e as { text: string }).text)
     return { value: { isCopied: true } }
@@ -180,6 +196,8 @@ test('a chat that is not a registered vertical writes nothing on session.measure
 test('/verticali opens the pane and still answers with the text', async ($, on) => {
   const opened: string[] = []
   mock.store(on, { 'v:a': v('a') })
+  on('session.id', () => ({ value: 'main' }))
+  here(on)
   on('ui.open', ($, e) => {
     opened.push((e as { id: string }).id)
     return { value: { isPlaced: true } }
@@ -187,4 +205,26 @@ test('/verticali opens the pane and still answers with the text', async ($, on) 
   const ran = await $.command.run({ command: 'verticali', args: '' } as never)
   expect(opened).toEqual(['verticali'])
   expect(ran.text).toContain('slug-a')
+})
+
+test('the pane and /verticali hide the verticals of other projects', async ($, on) => {
+  mock.store(on, {
+    'v:mine': v('mine', { cwd: '/repo/a', project: '/repo/a' }),
+    'v:wt': v('wt', { cwd: '/repo/a-worktree', project: '/repo/a' }),
+    'v:old': v('old', { cwd: '/repo/a' }),
+    'v:other': v('other', { cwd: '/repo/b', project: '/repo/b' }),
+    'v:child': v('child', { cwd: '/repo/b', project: '/repo/b', parentSessionId: 'main' }),
+  })
+  on('session.id', () => ({ value: 'main' }))
+  here(on, '/repo/a')
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const ui = await $.ui.mount(pane)
+  for (const slug of ['slug-mine', 'slug-wt', 'slug-old', 'slug-child'])
+    expect(await ui.findAll({ type: 'Text', text: new RegExp(slug) })).not.toHaveLength(0)
+  expect(await ui.findAll({ type: 'Text', text: /slug-other/ })).toHaveLength(0)
+
+  const listed = await $.command.run({ command: 'verticali', args: '' } as never)
+  expect(listed.text).not.toContain('slug-other')
+  const all = await $.command.run({ command: 'verticali', args: 'tutte' } as never)
+  expect(all.text).toContain('slug-other')
 })

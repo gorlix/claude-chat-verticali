@@ -1,6 +1,6 @@
 # chat-verticali
 
-Una mod di Claude Code (plugin con hooks module TypeScript) per lavorare a "chat verticali": una chat per ogni task PACA, argomento o funzione di un repo. Quando il lavoro cambia verticale, o il contesto si riempie, la chat corrente passa il testimone a una nuova chat in una finestra tmux, con un brief scritto per bastare da solo; a lavoro finito la nuova chat riporta il risultato alla chat madre. Versione 0.2.1.
+Una mod di Claude Code (plugin con hooks module TypeScript) per lavorare a "chat verticali": una chat per ogni task PACA, argomento o funzione di un repo. Quando il lavoro cambia verticale, o il contesto si riempie, la chat corrente passa il testimone a una nuova chat in una finestra tmux, con un brief scritto per bastare da solo; a lavoro finito la nuova chat riporta il risultato alla chat madre. Versione 0.2.2.
 
 Nasce da un'abitudine pratica: una chat lunga e che salta tra più cose si degrada. Meglio chat corte e mirate, e un passaggio di consegne esplicito.
 
@@ -21,7 +21,7 @@ Nasce da un'abitudine pratica: una chat lunga e che salta tra più cose si degra
 | Cosa | Tipo | Che cosa fa |
 |---|---|---|
 | `/handoff <tema>` | comando | Fa preparare al modello (con un fork della conversazione) slug, titolo, scope e brief sul tema dato, poi avvia l'handoff come il tool. Senza tema stampa l'uso. |
-| `/verticali` | comando | Apre il pannello Verticali e stampa l'elenco testuale: stato, slug, titolo, modello, data, task PACA, percorso del brief e comando di ripresa. |
+| `/verticali [tutte]` | comando | Apre il pannello Verticali e stampa l'elenco testuale delle verticali di questo progetto (con `tutte`, di ogni progetto): stato, slug, titolo, modello, data, task PACA, percorso del brief e comando di ripresa. |
 | `handoff` | tool MCP (`mcp__chat-verticali__handoff`) | Apre una nuova chat verticale. Parametri: `slug`, `title`, `scope`, `brief` (obbligatori); `paca_task_id`, `paca_ref`, `model`, `cwd` (opzionali). Va chiamato solo dopo averlo proposto all'utente. |
 | `vertical_done` | tool MCP (`mcp__chat-verticali__vertical_done`) | Chiude o mette in pausa la verticale corrente. Parametri: `summary` (obbligatorio), `status` (`done` o `paused`, default `done`). |
 
@@ -64,7 +64,7 @@ Come si legge una riga:
 - Il pulsante **Vai** manca nelle righe chiuse e nella riga della chat corrente. Salta alla finestra tmux con `tmux select-window -t <slug>`. Se la finestra non c'è più, o non si è in tmux, copia `claude --resume <sessione>` negli appunti e lo segnala con un toast.
 - La barra di contesto non c'è per le verticali chiuse, né finché la verticale non ha misurato il suo contesto.
 
-Con il registro vuoto il pannello dice `Nessuna chat verticale registrata.`
+Il pannello mostra solo le verticali del progetto della sessione: stessa repo git (le worktree contano come la repo principale) o, fuori da git, stessa cartella. Fanno eccezione le verticali legate alla sessione corrente (figlie o madre), mostrate ovunque siano. Senza verticali nel progetto il pannello dice `Nessuna chat verticale in questo progetto.`
 
 Colori e glifi:
 

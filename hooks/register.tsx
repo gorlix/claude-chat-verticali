@@ -20,6 +20,8 @@ type Vertical = {
   sessionId: string
   parentSessionId?: string
   cwd: string
+  // Repo the vertical belongs to (git common dir, shared by worktrees); missing on old records.
+  project?: string
   model: Model
   briefPath: string
   pacaTaskId?: string
@@ -84,6 +86,36 @@ async function allVerticals($: EngineInterface): Promise<Vertical[]> {
   return list
 }
 
+// The project of a folder: its git common dir without the trailing `.git`, so a
+// repo and its worktrees match; the folder itself outside git.
+const projects = new Map<string, Promise<string>>()
+function projectOf($: EngineInterface, cwd: string): Promise<string> {
+  let found = projects.get(cwd)
+  if (!found) {
+    found = $.process
+      .run(['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd, timeoutMs: 5_000 })
+      .then(ran => (ran.exitCode === 0 ? ran.stdout.trim().replace(/\/\.git\/?$/, '') : cwd))
+      .catch(() => cwd)
+    projects.set(cwd, found)
+  }
+  return found
+}
+
+// The verticals of this session's project, plus any tied to this session itself
+// (its own record, its children, its mother) wherever they live.
+async function projectVerticals($: EngineInterface): Promise<Vertical[]> {
+  const id = await $.session.id()
+  const here = await projectOf($, await $.session.cwd())
+  const list = await allVerticals($)
+  const mother = list.find(v => v.sessionId === id)?.parentSessionId
+  const kept: Vertical[] = []
+  for (const v of list) {
+    const tied = v.sessionId === id || v.parentSessionId === id || v.sessionId === mother
+    if (tied || (v.project ?? (await projectOf($, v.cwd))) === here) kept.push(v)
+  }
+  return kept
+}
+
 async function handoffDir($: EngineInterface): Promise<string> {
   const home = (await $.env.get('HOME')) ?? '/tmp'
   return `${home}/.claude/handoffs`
@@ -146,7 +178,7 @@ async function startHandoff($: EngineInterface, input: HandoffInput): Promise<st
   const slug = slugify(input.slug || input.title)
   const parentId = await $.session.id()
   const parent = (await $.store.get(verticalKey(parentId))) as Vertical | undefined
-  const existing = (await allVerticals($)).find(v => v.slug === slug && v.status !== 'done')
+  const existing = (await projectVerticals($)).find(v => v.slug === slug && v.status !== 'done')
 
   if (existing) {
     const choice = await $.ui.ask(
@@ -186,6 +218,7 @@ async function startHandoff($: EngineInterface, input: HandoffInput): Promise<st
     status: 'active',
     createdAt: await today($),
   }
+  v.project = await projectOf($, v.cwd)
   await $.fs.write(v.briefPath, briefText(v, input.brief, parent ? `verticale ${parent.slug}` : `sessione ${parentId}`))
   await $.store.set(verticalKey(v.sessionId), v)
   await update($, tick, n => (n ?? 0) + 1)
@@ -310,7 +343,7 @@ export const register: Register = on => {
       },
     })
     await $.command.register({ name: 'handoff', description: 'Passa il contesto su <tema> a una nuova chat verticale' })
-    await $.command.register({ name: 'verticali', description: 'Elenca le chat verticali registrate' })
+    await $.command.register({ name: 'verticali', description: 'Elenca le chat verticali di questo progetto (`tutte` per ogni progetto)' })
 
     const v = await thisVertical($)
     if (v) $.ui.status(`⟂ ${v.slug}`)
@@ -318,7 +351,7 @@ export const register: Register = on => {
     // Pane: opened only where verticals are active; refreshed when the registry changes.
     let signature = ''
     $.clock.every(POLL_MS, () => {
-      void allVerticals($)
+      void projectVerticals($)
         .then(list => {
           const now = JSON.stringify(list)
           if (now === signature) return
@@ -438,10 +471,11 @@ export const register: Register = on => {
     }
   })
 
-  on('command.run', { command: 'verticali' }, async $ => {
+  on('command.run', { command: 'verticali' }, async ($, e) => {
     await openPane($).catch(() => undefined)
-    const list = await allVerticals($)
-    if (list.length === 0) return { text: 'Nessuna chat verticale registrata.' }
+    const everywhere = e.args.trim() === 'tutte'
+    const list = everywhere ? await allVerticals($) : await projectVerticals($)
+    if (list.length === 0) return { text: everywhere ? 'Nessuna chat verticale registrata.' : 'Nessuna chat verticale in questo progetto (`/verticali tutte` per vederle tutte).' }
     const rows = list
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
       .map(v => `${v.status === 'active' ? '●' : v.status === 'paused' ? '◐' : '○'} ${v.slug} — ${v.title} [${v.model}, ${v.createdAt}]${v.pacaRef ? ` ${v.pacaRef}` : ''}\n    ${v.briefPath} · claude --resume ${v.sessionId}`)
@@ -452,7 +486,7 @@ export const register: Register = on => {
     const { Box, Button, Text } = $.ui.resolve(e)
     await read($, tick) // subscribes: a bump redraws
     const currentId = await $.session.id()
-    const list = await allVerticals($)
+    const list = await projectVerticals($)
     const current = list.find(v => v.sessionId === currentId)
     const columns = e.viewport?.columns ?? 40
     const titleWidth = Math.max(12, columns - 14)
@@ -515,7 +549,7 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        {list.length === 0 && section(PANE_TITLE, undefined, <Text dimColor>Nessuna chat verticale registrata.</Text>)}
+        {list.length === 0 && section(PANE_TITLE, undefined, <Text dimColor>Nessuna chat verticale in questo progetto.</Text>)}
         {active.length > 0 && section(`Attive (${active.length})`, 'green', active.map(row))}
         {paused.length > 0 && section(`In pausa (${paused.length})`, 'yellow', paused.map(row))}
         {done.length > 0 &&
