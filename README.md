@@ -116,7 +116,7 @@ Dalla 1.1 la mod lavora anche in zellij (**0.45.1 verificato**: servono le azion
 | Nascondi / chiusura a done | `kill-window` | `action close-tab-by-id` |
 | Rinomina l'hub | `rename-window` | `action rename-tab-by-id` (tab trovata da `$ZELLIJ_PANE_ID` con `list-panes -j`) |
 
-- zellij non ha opzioni sulle tab: l'id della tab è salvato nel record della verticale (`mux: { kind, session, tabId }`) e l'hub la considera aperta se `list-tabs -j` la elenca.
+- zellij non ha opzioni sulle tab: l'id della tab è salvato nel record della verticale (`mux: { kind, session, tabId }`) e l'hub la considera aperta solo se `list-panes -j -t -c` mostra in quella tab un pane non plugin con `claude attach <id>` (zellij riusa gli id delle tab liberate: una tab estranea sullo stesso id non si tocca mai).
 - `--close-on-exit`: uscire da `claude attach` (←) chiude la tab, come Nascondi; la sessione resta viva.
 - La chiusura a `done` parte dalla sessione in background, che non ha `$ZELLIJ`: usa `zellij --session <sessione del record> action ...`.
 - Limite: le tab si rilevano solo nella sessione zellij in cui sono state aperte. La mod non crea sessioni zellij né tocca `config.kdl`.

@@ -220,7 +220,7 @@ async function muxOpen(
 
 // Open windows by session id. tmux: the tagged ones, in every tmux session.
 // zellij: the tab each record points to, if it still exists in its session.
-async function muxWindows($: EngineInterface, records: { sessionId: string; mux?: Mux }[]): Promise<Record<string, string>> {
+async function muxWindows($: EngineInterface, records: { sessionId: string; agentId?: string; mux?: Mux }[]): Promise<Record<string, string>> {
   const found: Record<string, string> = {}
   const ran = await $.process.run(['tmux', 'list-windows', '-a', '-F', '#{window_id}\t#{@cv_id}']).catch(() => undefined)
   if (ran && ran.exitCode === 0) {
@@ -229,21 +229,26 @@ async function muxWindows($: EngineInterface, records: { sessionId: string; mux?
       if (win && id) found[id] = win
     }
   }
-  const bySession = new Map<string, { sessionId: string; tabId: number }[]>()
+  // zellij reuses freed tab ids: a tab is the vertical's only if it holds a
+  // terminal pane running `claude attach <agentId>`; else it is hidden.
+  const bySession = new Map<string, { sessionId: string; tabId: number; agentId: string }[]>()
   for (const r of records) {
-    if (r.mux?.kind !== 'zellij' || !r.mux.session || r.mux.tabId === undefined) continue
-    bySession.set(r.mux.session, [...(bySession.get(r.mux.session) ?? []), { sessionId: r.sessionId, tabId: r.mux.tabId }])
+    if (r.mux?.kind !== 'zellij' || !r.mux.session || r.mux.tabId === undefined || !r.agentId) continue
+    bySession.set(r.mux.session, [...(bySession.get(r.mux.session) ?? []), { sessionId: r.sessionId, tabId: r.mux.tabId, agentId: r.agentId }])
   }
   for (const [session, list] of bySession) {
-    const tabs = await zellij($, session, 'list-tabs', '-j').catch(() => undefined)
-    if (!tabs || tabs.exitCode !== 0) continue
-    let ids: Set<number>
+    const ran = await zellij($, session, 'list-panes', '-j', '-t', '-c').catch(() => undefined)
+    if (!ran || ran.exitCode !== 0) continue
+    let panes: { is_plugin: boolean; tab_id: number; pane_command?: string }[]
     try {
-      ids = new Set((JSON.parse(tabs.stdout) as { tab_id: number }[]).map(t => t.tab_id))
+      panes = JSON.parse(ran.stdout)
     } catch {
       continue
     }
-    for (const r of list) if (ids.has(r.tabId)) found[r.sessionId] = zellijHandle({ session, tabId: r.tabId })
+    for (const r of list) {
+      const ours = panes.some(p => !p.is_plugin && p.tab_id === r.tabId && p.pane_command?.includes(`attach ${r.agentId}`))
+      if (ours) found[r.sessionId] = zellijHandle({ session, tabId: r.tabId })
+    }
   }
   return found
 }
