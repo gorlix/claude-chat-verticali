@@ -181,9 +181,12 @@ test('Vai on a missing window, or outside tmux, copies the resume command', asyn
 })
 
 // A store the test can read back: the plugin's `$.store` is not on the test's `$`.
-const spyStore = (on: Parameters<typeof mock.store>[0], seed: Record<string, unknown>) => {
+const spyStore = (on: Parameters<typeof mock.store>[0], seed: Record<string, unknown>, broken = () => false) => {
   const data = new Map(Object.entries(seed))
-  on('store.get', (_$, e) => ({ value: data.get((e as { key: string }).key) }))
+  on('store.get', (_$, e) => {
+    if (broken()) throw new Error('store down')
+    return { value: data.get((e as { key: string }).key) }
+  })
   on('store.set', (_$, e) => {
     const { key, value } = e as { key: string; value: unknown }
     data.set(key, JSON.parse(JSON.stringify(value)))
@@ -519,13 +522,14 @@ test('the hub adopts the open children and the inbox of a mother that is gone', 
 
 // A vertical in /repo on main; `git` answers from `repo`, which a test changes.
 const gateSetup = (on: Parameters<typeof mock.store>[0], over: object = {}) => {
+  // `dirty` holds raw `git status --porcelain -z` entries; `gitCalls` counts git runs.
+  const repo = { branches: ['main', 'old'], dirty: [] as string[], head: 'main', stashes: [] as string[], gitCalls: 0, broken: false }
   const data = spyStore(on, {
     'v:a': v('a', {
       cwd: '/repo', project: '/repo', parentSessionId: 'mother', briefPath: '/tmp/a.md',
       startBranch: 'main', startBranches: ['main', 'old'], startWorktrees: [], startedAt: 1_000, ...over,
     }),
-  })
-  const repo = { branches: ['main', 'old'], dirty: [] as string[], head: 'main' }
+  }, () => repo.broken)
   const toasts: string[] = []
   on('session.id', () => ({ value: 'a' }))
   on('session.usage', () => ({ value: { context: {} } }))
@@ -540,10 +544,12 @@ const gateSetup = (on: Parameters<typeof mock.store>[0], over: object = {}) => {
     const argv = [...(e as { argv: string[] }).argv]
     const out = (stdout: string) => ({ value: { ...runOk, stdout } })
     if (argv[0] !== 'git') return out('')
-    if (argv[1] === 'rev-parse') return out('/repo/.git\n')
-    if (argv[1] === 'status') return out(repo.dirty.map(f => ` M ${f}`).join('\n'))
+    repo.gitCalls++
+    if (argv[1] === 'rev-parse') return out(argv.includes('--show-toplevel') ? '/repo\n' : '/repo/.git\n')
+    if (argv[1] === 'status') return out(repo.dirty.map(d => `${d}\0`).join(''))
     if (argv[1] === 'branch') return out(`${repo.head}\n`)
     if (argv[1] === 'for-each-ref') return out(repo.branches.join('\n'))
+    if (argv[1] === 'stash') return out(repo.stashes.join('\n'))
     return out('')
   })
   return { data, repo, toasts }
@@ -632,4 +638,117 @@ test('the hub asks the person to approve a child\'s pending plan, once, and writ
   expect(questions[0]).toContain('RIMUOVI git-ramo:f')
   expect(data.get('v:x')).toMatchObject({ cleanupStatus: 'approved' })
   expect(sent[0]).toContain('approvato')
+})
+
+// --- Review fixes (v1.0.0) ---
+
+test('a failing bookkeeping after Bash never runs the command a second time', async ($, on) => {
+  const { repo } = gateSetup(on)
+  let runs = 0
+  on('tool.call', { tool: 'Bash' }, () => {
+    runs++
+    repo.branches.push(`feat/n${runs}`)
+    // The bookkeeping after the command fails from here on.
+    repo.broken = true
+    return { result: 'ok' }
+  })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'git switch -c feat/n1 && git push' } as never)
+  expect(runs).toBe(1)
+  expect(ran.result).toBe('ok')
+})
+
+test('a Bash command that cannot create repo items takes no snapshot', async ($, on) => {
+  const { repo } = gateSetup(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: 'ok' }))
+  await $.tool.call({ tool: 'Bash', command: 'ls -la && cat README.md' } as never)
+  expect(repo.gitCalls).toBe(0)
+})
+
+test('a file already modified at the start is never mine, even when the vertical edits it', async ($, on) => {
+  const { data, repo } = gateSetup(on, { startDirty: ['/repo/wip.ts'] })
+  on('tool.call', { tool: 'Edit' }, () => ({ result: 'ok' }))
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/wip.ts', old_string: 'a', new_string: 'b' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/new.ts', old_string: 'a', new_string: 'b' } as never)
+  expect((data.get('v:a') as { created: { files: string[] } }).created.files).toEqual(['/repo/new.ts'])
+  repo.dirty.push(' M wip.ts', ' M new.ts')
+  const first = String((await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)).result)
+  const [mine, others] = first.split('Non attribuibili')
+  expect(mine).toContain('git-modifica:/repo/new.ts')
+  expect(others).toContain("git-modifica:/repo/wip.ts (già modificato all'avvio)")
+  const greedy = await $.tool.call({
+    tool: 'mcp__chat-verticali__vertical_done', summary: 'ok',
+    cleanup_plan: [
+      { item: 'git-modifica:/repo/new.ts', action: 'keep', reason: 'committato' },
+      { item: "git-modifica:/repo/wip.ts (già modificato all'avvio)", action: 'remove', reason: 'checkout' },
+    ],
+  } as never)
+  expect(String(greedy.result)).toContain('non attribuibili')
+})
+
+test('dirty paths come from the work tree root: subfolder cwd, untracked folders, renames, spaces', async ($, on) => {
+  const { repo } = gateSetup(on, { cwd: '/repo/sub', created: { files: ['/repo/newdir/x.ts', '/repo/new name.ts'] } })
+  repo.dirty.push('?? newdir/', 'R  new name.ts', 'old.ts', ' M sub/a.ts')
+  const text = String((await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)).result)
+  const [mine, others] = text.split('Non attribuibili')
+  expect(mine).toContain('git-modifica:/repo/newdir/')
+  expect(mine).toContain('git-modifica:/repo/new name.ts')
+  expect(others).toContain('git-modifica:/repo/sub/a.ts')
+  expect(text).not.toContain('old.ts')
+})
+
+test('stash items are keyed by hash, so a drop does not change them', async ($, on) => {
+  const { repo } = gateSetup(on, { created: { stashes: ['abcdef1234567890'] } })
+  repo.stashes.push('0000000000000000 2000 altro', 'abcdef1234567890 2000 mio')
+  const text = String((await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)).result)
+  expect(text.split('Non attribuibili')[0]).toContain('git-stash:abcdef123456 mio')
+  expect(text).not.toContain('stash@{')
+})
+
+test('a record from before the gate takes its baseline at the first inventory', async ($, on) => {
+  const { data, repo } = gateSetup(on, { startBranch: undefined, startBranches: undefined, startWorktrees: undefined, startedAt: undefined })
+  repo.head = 'feat/vecchio'
+  repo.branches.push('feat/vecchio')
+  const text = String((await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)).result)
+  expect(text).not.toContain('feat/vecchio')
+  expect((data.get('v:a') as { startedAt?: number }).startedAt).toBeDefined()
+})
+
+test('paused clears the cleanup state; something new after approval voids the plan', async ($, on) => {
+  const plan = [{ item: 'git-ramo:feat/x', action: 'remove', reason: 'r' }]
+  const { data, repo } = gateSetup(on, { created: { branches: ['feat/x'] }, cleanupStatus: 'approved', cleanupPlan: plan })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: void repo.branches.push('feat/y') }))
+  await $.tool.call({ tool: 'Bash', command: 'git switch -c feat/y' } as never)
+  expect(data.get('v:a')).toMatchObject({ created: { branches: ['feat/x', 'feat/y'] } })
+  expect((data.get('v:a') as { cleanupStatus?: string }).cleanupStatus).toBeUndefined()
+
+  data.set('v:a', { ...(data.get('v:a') as object), cleanupStatus: 'pending', cleanupPlan: plan })
+  await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok', status: 'paused' } as never)
+  expect(data.get('v:a')).toMatchObject({ status: 'paused' })
+  expect((data.get('v:a') as { cleanupPlan?: unknown }).cleanupPlan).toBeUndefined()
+})
+
+test('a mother that is itself a vertical approves its child\'s plan when no hub runs', async ($, on) => {
+  const data = spyStore(on, {
+    'v:m': v('m', { agentId: 'mm', parentSessionId: 'gone' }),
+    'v:x': v('x', { agentId: 'xx', parentSessionId: 'm', cleanupStatus: 'pending', cleanupPlan: [{ item: 'git-ramo:f', action: 'remove', reason: 'r' }] }),
+  })
+  const questions: string[] = []
+  const clock = mock.clock(on, { now: 1_760_000_000_000 })
+  on('session.id', () => ({ value: 'm' }))
+  on('env.get', () => ({ value: undefined }))
+  on('tool.register', () => ({ value: undefined }))
+  on('session.start', (_$, e) => e as never)
+  on('command.register', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.send', () => ({ isDelivered: true }))
+  on('tool.call', { tool: 'AskUserQuestion' }, (_$, e) => {
+    const q = (e as unknown as { questions: { question: string }[] }).questions[0].question
+    questions.push(q)
+    return { result: { answers: { [q]: 'Approva' } } }
+  })
+  here(on, '/tmp', hubRun([{ sessionId: 'm', id: 'mm' }, { sessionId: 'x', id: 'xx' }], {}))
+  await $.session.start({ source: 'startup', cwd: '/tmp', surface: null, isInteractive: true } as never)
+  await clock.advance(3000)
+  expect(questions).toHaveLength(1)
+  expect(data.get('v:x')).toMatchObject({ cleanupStatus: 'approved' })
 })

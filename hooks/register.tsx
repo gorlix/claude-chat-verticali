@@ -45,6 +45,8 @@ type Vertical = {
   startBranch?: string
   startBranches?: string[]
   startWorktrees?: string[]
+  // Files already modified when the vertical started: never its to clean.
+  startDirty?: string[]
   startedAt?: number
   // Cleanup gate before `done`: the plan waits for the mother's approval.
   cleanupStatus?: 'pending' | 'approved'
@@ -324,7 +326,7 @@ async function startHandoff($: EngineInterface, input: HandoffInput): Promise<st
     createdAt: await today($),
   }
   v.project = await projectOf($, v.cwd)
-  Object.assign(v, await baseline($, v.project))
+  Object.assign(v, await baseline($, v))
   const from = parent ? `verticale ${parent.slug}` : `sessione ${parentId}`
   // The brief exists before the launch: the new chat reads it on its first turn.
   await $.fs.write(v.briefPath, briefText(v, input.brief, from))
@@ -401,72 +403,120 @@ const worktreesOf = async ($: EngineInterface, repo: string) =>
     .map(l => l.slice(9))
     .filter(path => path !== repo)
 
+// Modified and untracked paths under a folder's work tree, absolute; an
+// untracked folder ends in `/`. `-z`: no quoting, a rename's old path skipped.
+async function dirtyOf($: EngineInterface, dir: string): Promise<string[]> {
+  const top = (await runOut($, ['git', 'rev-parse', '--show-toplevel'], dir)).trim()
+  if (!top) return []
+  const parts = (await runOut($, ['git', 'status', '--porcelain', '-z'], top)).split('\0')
+  const found: string[] = []
+  for (let i = 0; i < parts.length; i++) {
+    const entry = parts[i]
+    if (entry.length < 4) continue
+    found.push(`${top}/${entry.slice(3)}`)
+    if (entry[0] === 'R' || entry[0] === 'C') i++
+  }
+  return found
+}
+
+// A path is covered by a list when it is in it or under one of its folders.
+const covers = (list: readonly string[] | undefined, path: string) =>
+  Boolean(list?.some(p => p === path || (p.endsWith('/') && path.startsWith(p)) || (path.endsWith('/') && p.startsWith(path))))
+
+// The repo as a Bash call may change it: branches, worktrees, stashes, the
+// main checkout's branch, the files left modified. All at once.
+async function repoState($: EngineInterface, v: Vertical) {
+  const repo = v.project ?? (await projectOf($, v.cwd))
+  const [dirtyCwd, dirtyRepo, head, branches, worktrees, stashes] = await Promise.all([
+    dirtyOf($, v.cwd),
+    v.cwd === repo ? Promise.resolve([]) : dirtyOf($, repo),
+    runOut($, ['git', 'branch', '--show-current'], repo),
+    branchesOf($, repo),
+    worktreesOf($, repo),
+    runOut($, ['git', 'stash', 'list', '--format=%H %ct %s'], repo),
+  ])
+  return { repo, dirty: [...new Set([...dirtyCwd, ...dirtyRepo])], head: head.trim(), branches, worktrees, stashes: lines(stashes) }
+}
+type RepoState = Awaited<ReturnType<typeof repoState>>
+
 // What the repo looks like when the vertical starts.
-async function baseline($: EngineInterface, repo: string) {
+async function baseline($: EngineInterface, v: Vertical) {
+  const now = await repoState($, v)
   return {
-    startBranch: (await runOut($, ['git', 'branch', '--show-current'], repo)).trim() || undefined,
-    startBranches: await branchesOf($, repo),
-    startWorktrees: await worktreesOf($, repo),
+    startBranch: now.head || undefined,
+    startBranches: now.branches,
+    startWorktrees: now.worktrees,
+    startDirty: now.dirty,
     startedAt: Date.now(),
   }
 }
 
-// The repo as a Bash call may change it: branches, worktrees, stashes, the
-// main checkout's branch, the files left modified.
-async function repoState($: EngineInterface, v: Vertical) {
-  const repo = v.project ?? (await projectOf($, v.cwd))
-  const dirty: string[] = []
-  for (const dir of new Set([v.cwd, repo])) {
-    for (const l of lines(await runOut($, ['git', 'status', '--porcelain'], dir))) dirty.push(`${dir}/${l.slice(3)}`)
-  }
-  return {
-    repo,
-    dirty,
-    head: (await runOut($, ['git', 'branch', '--show-current'], repo)).trim(),
-    branches: await branchesOf($, repo),
-    worktrees: await worktreesOf($, repo),
-    stashes: lines(await runOut($, ['git', 'stash', 'list', '--format=%gd %H %ct %s'], repo)),
-  }
+// A record from before the gate has no baseline: take it now, so what was
+// already there is never counted as this vertical's.
+async function withBaseline($: EngineInterface, v: Vertical): Promise<Vertical> {
+  if (v.startedAt) return v
+  const based = { ...v, ...(await baseline($, v)) }
+  await $.store.set(verticalKey(v.sessionId), based)
+  return based
 }
-type RepoState = Awaited<ReturnType<typeof repoState>>
+
+// Records new items on the vertical. Something new after an approved plan
+// voids it: the plan no longer covers what is there.
+async function addCreated($: EngineInterface, v: Vertical, patch: Partial<Record<'branches' | 'worktrees' | 'stashes' | 'sessions' | 'files', string[]>>, head?: boolean) {
+  const fresh = (await thisVertical($)) ?? v
+  const c: Created = { ...fresh.created }
+  let added = false
+  for (const [key, items] of Object.entries(patch) as [keyof typeof patch, string[]][]) {
+    const before = c[key] ?? []
+    const next = [...new Set([...before, ...items])]
+    if (next.length !== before.length) {
+      c[key] = next
+      added = true
+    }
+  }
+  if (head !== undefined) c.head = head
+  if (!added && head === undefined) return
+  const reset = added && fresh.cleanupStatus ? { cleanupStatus: undefined, cleanupPlan: undefined } : {}
+  await $.store.set(verticalKey(v.sessionId), { ...fresh, created: c, ...reset })
+}
 
 // Adds to the record what appeared between two states, plus sessions the call started.
 async function noteCreated($: EngineInterface, v: Vertical, before: RepoState, after: RepoState, output: string) {
-  const fresh = (await thisVertical($)) ?? v
-  const c: Created = { ...fresh.created }
-  const add = (key: 'branches' | 'worktrees' | 'stashes' | 'sessions' | 'files', items: string[]) => {
-    if (items.length) c[key] = [...new Set([...(c[key] ?? []), ...items])]
-  }
   const fresh_ = (a: string[], b: string[]) => a.filter(x => !b.includes(x))
-  add('branches', fresh_(after.branches, before.branches))
-  add('worktrees', fresh_(after.worktrees, before.worktrees))
-  add('stashes', fresh_(after.stashes.map(l => l.split(' ')[1]), before.stashes.map(l => l.split(' ')[1])))
-  add('files', fresh_(after.dirty, before.dirty))
-  add('sessions', [...output.matchAll(/backgrounded\s+·\s+([\w-]+)/g)].map(m => m[1]))
-  if (after.head !== before.head) c.head = after.head !== (fresh.startBranch ?? after.head)
-  if (JSON.stringify(c) !== JSON.stringify(fresh.created ?? {})) await $.store.set(verticalKey(v.sessionId), { ...fresh, created: c })
+  const hash = (l: string) => l.split(' ')[0]
+  await addCreated($, v, {
+    branches: fresh_(after.branches, before.branches),
+    worktrees: fresh_(after.worktrees, before.worktrees),
+    stashes: fresh_(after.stashes.map(hash), before.stashes.map(hash)),
+    files: fresh_(after.dirty, before.dirty).filter(f => !covers(v.startDirty, f)),
+    sessions: [...output.matchAll(/backgrounded\s+·\s+([\w-]+)/g)].map(m => m[1]),
+  }, after.head !== before.head ? after.head !== (v.startBranch ?? after.head) : undefined)
 }
 
 // What lies around at `done`, one stable line per item. `mine`: made by this
 // vertical (its record says so), to keep or remove in the plan. `others`: not
 // attributable, reported as "non mio, non toccato" and never cleaned.
-async function inventory($: EngineInterface, v: Vertical): Promise<{ mine: string[]; others: string[] }> {
+async function inventory($: EngineInterface, vertical: Vertical): Promise<{ mine: string[]; others: string[] }> {
+  const v = await withBaseline($, vertical)
   const now = await repoState($, v)
   const c = v.created ?? {}
   const mine: string[] = []
   const others: string[] = []
   const put = (isMine: boolean | undefined, item: string) => (isMine ? mine : others).push(item)
-  for (const f of now.dirty) put(c.files?.includes(f), `git-modifica:${f}`)
-  const start = v.startBranch ?? 'main'
-  if (now.head && now.head !== start) put(c.head, `git-repo-principale-su:${now.head} (partenza ${start})`)
+  for (const f of now.dirty) {
+    if (covers(v.startDirty, f)) others.push(`git-modifica:${f} (già modificato all'avvio)`)
+    else put(covers(c.files, f), `git-modifica:${f}`)
+  }
+  if (v.startBranch && now.head && now.head !== v.startBranch) put(c.head, `git-repo-principale-su:${now.head} (partenza ${v.startBranch})`)
   const knownWt = new Set(v.startWorktrees ?? [])
   for (const wt of now.worktrees) if (!knownWt.has(wt)) put(c.worktrees?.includes(wt), `git-worktree:${wt}`)
-  const knownBr = new Set(v.startBranches ?? [start])
+  const knownBr = new Set(v.startBranches ?? [])
   for (const b of now.branches) if (!knownBr.has(b)) put(c.branches?.includes(b), `git-ramo:${b}`)
   const since = v.startedAt ?? Date.parse(v.createdAt)
   for (const l of now.stashes) {
-    const [ref, hash, at, ...msg] = l.split(' ')
-    if (c.stashes?.includes(hash) || Number(at) * 1000 >= since) put(c.stashes?.includes(hash), `git-stash:${ref} ${msg.join(' ')}`)
+    const [hash, at, ...msg] = l.split(' ')
+    const isMine = c.stashes?.includes(hash)
+    if (isMine || Number(at) * 1000 >= since) put(isMine, `git-stash:${hash.slice(0, 12)} ${msg.join(' ')}`)
   }
   const all = await allVerticals($)
   const registered = new Set(all.map(r => r.sessionId))
@@ -491,8 +541,10 @@ const planText = (plan: PlanItem[]) =>
 
 // `done` passes only through the gate: inventory, plan, the mother's approval,
 // cleanup, a clean second inventory. Returns why it stops, or undefined to close.
-async function cleanupGate($: EngineInterface, v: Vertical, input: DoneInput): Promise<string | undefined> {
+async function cleanupGate($: EngineInterface, vertical: Vertical, input: DoneInput): Promise<string | undefined> {
+  let v = vertical
   const { mine: items, others } = await inventory($, v)
+  v = (await thisVertical($)) ?? v
   const save = (patch: Partial<Vertical>) => $.store.set(verticalKey(v.sessionId), { ...v, ...patch })
 
   if (v.cleanupStatus === 'approved' && !input.cleanup_plan) {
@@ -533,7 +585,8 @@ async function cleanupGate($: EngineInterface, v: Vertical, input: DoneInput): P
   if (notMine.length) return `Il piano rimuove voci non attribuibili a questa verticale (non tue, non si toccano):\n${bullet(notMine)}\nToglile dal piano e rimandalo.`
   await save({ cleanupStatus: 'pending', cleanupPlan: input.cleanup_plan, cleanupNote: undefined })
   if (!v.parentSessionId) {
-    const answer = await askCleanup($, { ...v, cleanupPlan: input.cleanup_plan })
+    const answer = await askCleanup($, { ...v, cleanupStatus: 'pending', cleanupPlan: input.cleanup_plan })
+    if (!answer) return 'Domanda chiusa senza risposta: il piano resta in attesa. Richiama vertical_done con cleanup_plan per riproporla.'
     return answer === 'Approva'
       ? 'Piano approvato: esegui la pulizia, poi richiama vertical_done (status done) con cleanup_report.'
       : `Piano non approvato${answer === 'Rifiuta' ? '' : `: ${answer}`}. Correggilo e rimanda cleanup_plan.`
@@ -542,27 +595,52 @@ async function cleanupGate($: EngineInterface, v: Vertical, input: DoneInput): P
   return 'Piano di pulizia inviato alla chat madre per l\'approvazione. Aspetta la risposta (arriva come messaggio): non chiudere e non pulire ancora.'
 }
 
-// Asks the person to approve a vertical's cleanup plan; writes the answer on
-// its record. Anything typed under "Other" is a change the vertical must make.
-async function askCleanup($: EngineInterface, v: Vertical): Promise<string> {
-  const answer = await $.ui.ask(
-    `La verticale «${v.title}» vuole chiudersi. Piano di pulizia:\n${planText(v.cleanupPlan ?? [])}\nApprovi? (in "Other" scrivi le modifiche da chiedere)`,
-    { header: 'Pulizia', options: ['Approva', 'Rifiuta'] },
-  )
-  const fresh = ((await $.store.get(verticalKey(v.sessionId))) as Vertical | undefined) ?? v
-  const approved = answer === 'Approva'
-  await $.store.set(verticalKey(v.sessionId), {
-    ...fresh,
-    cleanupStatus: approved ? 'approved' : undefined,
-    cleanupNote: approved ? undefined : answer,
-  })
-  await bump($)
-  return answer
+// Plans with a question open now, and plans the poll already put once.
+const asking = new Set<string>()
+const asked = new Set<string>()
+
+// Who approves a vertical's plan: the project's hub while it runs (it adopts
+// every mother's children), else the vertical's mother, vertical or not.
+async function approverOf($: EngineInterface, v: Vertical): Promise<string | undefined> {
+  const hub = (await $.store.get(hubKey(v.project ?? (await projectOf($, v.cwd))))) as string | undefined
+  if (hub && hub !== v.sessionId && (await listAgents($)).some(a => a.sessionId === hub)) return hub
+  return v.parentSessionId
 }
 
-// The mother (or the hub that adopted the vertical) answers a pending plan.
+// Asks the person to approve a vertical's cleanup plan; writes the answer on
+// its record. Anything typed under "Other" is a change the vertical must make.
+// Undefined when a question for it is already open, or it is closed unanswered.
+async function askCleanup($: EngineInterface, v: Vertical): Promise<string | undefined> {
+  if (asking.has(v.sessionId)) return undefined
+  asking.add(v.sessionId)
+  try {
+    const plan = v.cleanupPlan ?? []
+    const answer = await $.ui.ask(
+      `La verticale «${v.title}» vuole chiudersi. Piano di pulizia:\n${planText(plan)}\nApprovi? (in "Other" scrivi le modifiche da chiedere)`,
+      { header: 'Pulizia', options: ['Approva', 'Rifiuta'] },
+    ).catch(() => undefined)
+    if (!answer?.trim()) return undefined
+    const fresh = ((await $.store.get(verticalKey(v.sessionId))) as Vertical | undefined) ?? v
+    // The plan changed or was answered meanwhile: this answer is for an old one.
+    if (fresh.cleanupStatus !== 'pending' || JSON.stringify(fresh.cleanupPlan) !== JSON.stringify(plan)) return undefined
+    const approved = answer === 'Approva'
+    await $.store.set(verticalKey(v.sessionId), {
+      ...fresh,
+      cleanupStatus: approved ? 'approved' : undefined,
+      cleanupPlan: approved ? plan : undefined,
+      cleanupNote: approved ? undefined : answer,
+    })
+    await bump($)
+    return answer
+  } finally {
+    asking.delete(v.sessionId)
+  }
+}
+
+// The approver answers a pending plan and tells the vertical.
 async function answerCleanup($: EngineInterface, v: Vertical) {
   const answer = await askCleanup($, v)
+  if (!answer) return
   const text = answer === 'Approva'
     ? '[chat-verticali] Piano di pulizia approvato dall\'utente: eseguilo ora, poi chiama vertical_done (status done) con cleanup_report.'
     : `[chat-verticali] Piano di pulizia ${answer === 'Rifiuta' ? 'rifiutato' : `da modificare: ${answer}`}. Correggilo e richiama vertical_done con un nuovo cleanup_plan.`
@@ -587,7 +665,8 @@ async function finishVertical(
   }
   await $.fs.write(v.briefPath,
     `${await $.fs.read(v.briefPath)}\n## Esito (${status}, ${await today($)})\n\n${summary}\n`)
-  await $.store.set(verticalKey(v.sessionId), { ...((await thisVertical($)) ?? v), status })
+  const reset = status === 'paused' ? { cleanupStatus: undefined, cleanupPlan: undefined, cleanupNote: undefined } : {}
+  await $.store.set(verticalKey(v.sessionId), { ...((await thisVertical($)) ?? v), status, ...reset })
 
   let parentNote = 'nessuna chat madre registrata'
   if (v.parentSessionId) {
@@ -781,8 +860,6 @@ function rulesSection(v: Vertical | undefined): string {
 let clearedFrom: string | undefined
 // The hub row the focus ring is on: the target of the a/h/s/x hotkeys.
 let selected: string | undefined
-// Cleanup plans already put to the person, so the poll asks once each.
-const asked = new Set<string>()
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -865,13 +942,14 @@ export const register: Register = on => {
           const fresh = await refresh($)
           if (fresh.changed) changed = true
           await adoptOrphans($, fresh.state.live)
-          const id = await $.session.id()
-          for (const v of list) {
-            if (v.cleanupStatus !== 'pending') asked.delete(v.sessionId)
-            else if (v.parentSessionId === id && !asked.has(v.sessionId)) {
-              asked.add(v.sessionId)
-              void answerCleanup($, v).catch(() => undefined)
-            }
+        }
+        // Pending cleanup plans this session approves, a vertical mother included: once each.
+        const id = await $.session.id()
+        for (const v of list) {
+          if (v.cleanupStatus !== 'pending') asked.delete(v.sessionId)
+          else if (!asked.has(v.sessionId) && (await approverOf($, v)) === id) {
+            asked.add(v.sessionId)
+            void answerCleanup($, v).catch(() => undefined)
           }
         }
         if (changed) await bump($)
@@ -929,46 +1007,71 @@ export const register: Register = on => {
 
   // A vertical notes what it creates, so its cleanup touches only its own mess:
   // files its edits leave, and what a Bash or EnterWorktree call adds to the repo.
+  // The tool runs once: no `.catch` that would call `next` again, and a failure
+  // in the bookkeeping after it is swallowed, never retried.
   on('tool.call', { tool: /^(Edit|Write|NotebookEdit)$/ }, async ($, e, next) => {
     const ran = await next(e)
-    const v = await thisVertical($)
-    const input = e as unknown as { file_path?: string; notebook_path?: string }
-    const path = input.file_path ?? input.notebook_path
-    if (v && path && ran.deny === undefined) {
-      const files = [...new Set([...(v.created?.files ?? []), path])]
-      if (files.length !== (v.created?.files ?? []).length) await $.store.set(verticalKey(v.sessionId), { ...v, created: { ...v.created, files } })
+    try {
+      const v = await thisVertical($)
+      const input = e as unknown as { file_path?: string; notebook_path?: string }
+      const path = input.file_path ?? input.notebook_path
+      if (v && path && ran.deny === undefined) {
+        const based = await withBaseline($, v)
+        if (!covers(based.startDirty, path)) await addCreated($, based, { files: [path] })
+      }
+    } catch {
+      // Not recorded: the file counts as not this vertical's, so it is left alone.
     }
     return ran
-  }).catch(($, e, next) => next(e))
+  })
 
+  // Only a call that can create repo items or sessions pays for the snapshots.
+  const CREATES = /\b(git|claude|gh|worktree)\b/
   on('tool.call', { tool: /^(Bash|EnterWorktree)$/ }, async ($, e, next) => {
-    const v = await thisVertical($)
-    if (!v) return next(e)
-    const before = await repoState($, v)
+    let v: Vertical | undefined
+    let before: RepoState | undefined
+    try {
+      const command = (e as unknown as { command?: string }).command ?? ''
+      v = await thisVertical($)
+      if (v && ((e as unknown as { tool: string }).tool === 'EnterWorktree' || CREATES.test(command))) {
+        v = await withBaseline($, v)
+        before = await repoState($, v)
+      }
+    } catch {
+      before = undefined
+    }
     const ran = await next(e)
-    await noteCreated($, v, before, await repoState($, v), JSON.stringify(ran.result ?? ''))
+    try {
+      if (v && before) await noteCreated($, v, before, await repoState($, v), JSON.stringify(ran.result ?? ''))
+    } catch {
+      // Not recorded: whatever it made counts as not this vertical's.
+    }
     return ran
-  }).catch(($, e, next) => next(e))
+  })
 
   // Trigger: a different PACA task changes status in this chat.
   on('tool.call', { tool: /^mcp__paca(-[\w-]+)?__update_task$/ }, async ($, e, next) => {
     const ran = await next(e)
     const input = e as unknown as { taskId?: string; statusId?: string }
     if (ran.deny !== undefined || !input.statusId || !input.taskId) return ran
-
-    const sessionId = await $.session.id()
-    const v = await thisVertical($)
-    let focus = v?.pacaTaskId ?? ((await $.store.get(focusKey(sessionId))) as string | undefined)
-    if (!focus) {
-      await $.store.set(focusKey(sessionId), input.taskId)
+    try {
+      const sessionId = await $.session.id()
+      const v = await thisVertical($)
+      const focus = v?.pacaTaskId ?? ((await $.store.get(focusKey(sessionId))) as string | undefined)
+      if (!focus) {
+        await $.store.set(focusKey(sessionId), input.taskId)
+        return ran
+      }
+      if (focus === input.taskId) return ran
+      const note =
+        `[chat-verticali] Hai cambiato lo stato di un task PACA (\`${input.taskId}\`) diverso dal verticale di questa chat (\`${focus}\`). ` +
+        'Se stai iniziando a lavorarci, proponi all\'utente di passarlo a una chat verticale dedicata (tool handoff).'
+      return { ...ran, context: [...(ran.context ?? []), note] }
+    } catch {
+      // The update ran once; the reminder is only skipped.
       return ran
     }
-    if (focus === input.taskId) return ran
-    const note =
-      `[chat-verticali] Hai cambiato lo stato di un task PACA (\`${input.taskId}\`) diverso dal verticale di questa chat (\`${focus}\`). ` +
-      'Se stai iniziando a lavorarci, proponi all\'utente di passarlo a una chat verticale dedicata (tool handoff).'
-    return { ...ran, context: [...(ran.context ?? []), note] }
-  }).catch(($, e, next) => next(e))
+  })
 
   // vertical_done: close the window (and, when done, stop the session) once the
   // turn that called it ends. Otherwise: note the activity for the hub and warn
@@ -1074,6 +1177,8 @@ export const register: Register = on => {
     const compact = columns < COMPACT_COLUMNS
     const now = state?.at || Date.now()
 
+    const approvers = new Map<string, string | undefined>()
+    for (const v of list) if (v.cleanupStatus === 'pending') approvers.set(v.sessionId, await approverOf($, v))
     const att = (v: Vertical) => attention(v, liveBy.get(v.sessionId), Boolean(windows[v.sessionId]))
     const rank = (v: Vertical) => ATTENTION.indexOf(att(v))
 
@@ -1139,7 +1244,7 @@ export const register: Register = on => {
             </Text>
           )}
           {!compact && lastAt && <Text dimColor> {ago(now - Date.parse(lastAt))}</Text>}
-          {v.cleanupStatus === 'pending' && v.parentSessionId === currentId && (
+          {v.cleanupStatus === 'pending' && approvers.get(v.sessionId) === currentId && (
             <Box marginLeft={1}>
               <Button key={`cleanup-${v.sessionId}`} label="Pulizia" variant="primary" onPress={() => void answerCleanup($, v).catch(() => undefined)} />
             </Box>
