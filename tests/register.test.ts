@@ -458,8 +458,8 @@ test('hub keys: Vai selects or opens by id, Nascondi kills the window, Stop and 
   expect(sent[0]).toContain('vertical_done')
 })
 
-const bgDone = (on: Parameters<typeof mock.store>[0]) => {
-  const data = spyStore(on, { 'v:a': v('a', { agentId: 'aa', parentSessionId: 'mother', briefPath: '/tmp/a.md', cleanupStatus: 'approved', cleanupPlan: [] }) })
+const bgDone = (on: Parameters<typeof mock.store>[0], zellij = false) => {
+  const data = spyStore(on, { 'v:a': v('a', { agentId: 'aa', parentSessionId: 'mother', briefPath: '/tmp/a.md', cleanupStatus: 'approved', cleanupPlan: [], ...(zellij ? { mux: { kind: 'zellij', session: 'zs', tabId: 5 } } : {}) }) })
   const runs: string[][] = []
   on('session.id', () => ({ value: 'a' }))
   on('session.usage', () => ({ value: { context: {} } }))
@@ -470,7 +470,7 @@ const bgDone = (on: Parameters<typeof mock.store>[0]) => {
   on('session.send', () => ({ isDelivered: true }))
   on('ui.toast', () => ({ value: undefined }))
   on('turn.complete', ($, e) => ({ text: (e as { answer: string }).answer }))
-  here(on, '/tmp', hubRun([], { a: '@5' }, runs))
+  here(on, '/tmp', zellij ? zRun([], [5], runs) : hubRun([], { a: '@5' }, runs))
   return { data, runs }
 }
 
@@ -782,4 +782,72 @@ test('EnterWorktree records the worktree it creates', async ($, on) => {
   on('tool.call', { tool: 'EnterWorktree' }, () => ({ result: void repo.worktrees.push('/repo/.claude/worktrees/x') }))
   await $.tool.call({ tool: 'EnterWorktree', name: 'x' } as never)
   expect(data.get('v:a')).toMatchObject({ created: { worktrees: ['/repo/.claude/worktrees/x'] } })
+})
+
+// --- zellij: the same cases, with tab ids in the record instead of tmux tags ---
+
+const zellijEnv = (name: string) => ({ ZELLIJ: '0', ZELLIJ_SESSION_NAME: 'zs', ZELLIJ_PANE_ID: '3', HOME: '/home/x' } as Record<string, string>)[name]
+const tabs = (...ids: number[]) => JSON.stringify(ids.map(tab_id => ({ tab_id })))
+const zRun = (live: object[], open: number[], runs: string[][], other?: (argv: string[]) => unknown) =>
+  hubRun(live, {}, runs, argv =>
+    argv[0] === 'zellij' && argv[4] === 'list-tabs' ? { ...runOk, stdout: tabs(...open) }
+      : argv[0] === 'zellij' && argv[4] === 'list-panes' ? { ...runOk, stdout: JSON.stringify([{ id: 3, is_plugin: true, tab_id: 9 }, { id: 3, is_plugin: false, tab_id: 4 }]) }
+      : other?.(argv) ?? runOk)
+
+test('zellij handoff opens a tab by id, keeps its id in the record and renames the hub tab', async ($, on) => {
+  const data = spyStore(on, {})
+  const runs: string[][] = []
+  mock.clock(on, { now: 1_760_000_000_000 })
+  on('session.id', () => ({ value: 'main' }))
+  on('env.get', (_$, e) => ({ value: zellijEnv((e as { name: string }).name) }))
+  on('fs.write', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('command.run', { command: 'rename' }, () => ({ text: '' }))
+  sayYes(on)
+  here(on, '/tmp', zRun(
+    [{ sessionId: 'uuid-1', id: 'ab12cd34', name: 'x' }, { sessionId: 'main', name: 'chat' }], [], runs,
+    argv => argv[1] === '--bg' ? { ...runOk, stdout: 'backgrounded · ab12cd34 · x\n' } : argv[4] === 'new-tab' ? { ...runOk, stdout: '7\n' } : undefined,
+  ))
+  const ran = await $.tool.call({ tool: 'mcp__chat-verticali__handoff', slug: 'x', title: 'Titolo x', scope: 's', brief: 'b' } as never)
+  expect(ran.result).toContain('aperta nella tab zellij')
+  expect(runs).toContainEqual(['zellij', '--session', 'zs', 'action', 'new-tab', '-n', 'Titolo x', '-c', '/tmp', '--close-on-exit', '--', 'claude', 'attach', 'ab12cd34'])
+  expect(data.get('v:uuid-1')).toMatchObject({ agentId: 'ab12cd34', mux: { kind: 'zellij', session: 'zs', tabId: 7 } })
+  expect(runs).toContainEqual(['zellij', '--session', 'zs', 'action', 'rename-tab-by-id', '4', 'hub'])
+})
+
+test('zellij hub keys: Vai goes to or opens the tab, Nascondi closes it, Stop closes it and stops', async ($, on) => {
+  const runs: string[][] = []
+  mock.store(on, {
+    'v:a': v('a', { agentId: 'aa', parentSessionId: 'main', mux: { kind: 'zellij', session: 'zs', tabId: 5 } }),
+    'v:b': v('b', { agentId: 'bb', parentSessionId: 'main', mux: { kind: 'zellij', session: 'zs', tabId: 6 } }),
+  })
+  on('session.id', () => ({ value: 'main' }))
+  on('env.get', (_$, e) => ({ value: zellijEnv((e as { name: string }).name) }))
+  on('session.send', () => ({ isDelivered: true }))
+  on('ui.toast', () => ({ value: undefined }))
+  sayYes(on)
+  // Tab 5 is open (a); tab 6 is gone (b hidden).
+  here(on, '/tmp', zRun([{ sessionId: 'a', id: 'aa', status: 'idle' }, { sessionId: 'b', id: 'bb', status: 'idle' }], [5], runs,
+    argv => argv[4] === 'new-tab' ? { ...runOk, stdout: '8\n' } : undefined))
+  const ui = await $.ui.mount(widePane)
+  const acts = () => runs.filter(r => !['agents', 'list-windows'].includes(r[1]) && r[4] !== 'list-tabs')
+
+  await ui.press({ key: 'go-a' })
+  expect(acts()).toEqual([['zellij', '--session', 'zs', 'action', 'go-to-tab-by-id', '5']])
+  runs.length = 0
+  await ui.press({ key: 'go-b' })
+  expect(acts()[0]).toEqual(['zellij', '--session', 'zs', 'action', 'new-tab', '-n', 'Titolo b', '-c', '/tmp', '--close-on-exit', '--', 'claude', 'attach', 'bb'])
+  runs.length = 0
+  await ui.press({ key: 'hide-a' })
+  expect(acts()).toEqual([['zellij', '--session', 'zs', 'action', 'close-tab-by-id', '5']])
+  runs.length = 0
+  await ui.press({ key: 'k-stop' })
+  expect(acts()).toEqual([['zellij', '--session', 'zs', 'action', 'close-tab-by-id', '5'], ['claude', 'stop', 'aa']])
+})
+
+test('a zellij vertical, done: its tab closes by id from a detached shell, then the session stops', async ($, on) => {
+  const { runs } = bgDone(on, true)
+  await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)
+  await $.turn.complete(turnEnd())
+  expect(runs.find(r => r[0] === 'setsid')).toEqual(['setsid', '-f', 'sh', '-c', "exec >/dev/null 2>&1; sleep 5; zellij --session 'zs' action close-tab-by-id 5; claude stop 'aa'"])
 })

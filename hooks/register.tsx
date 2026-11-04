@@ -27,6 +27,8 @@ type Vertical = {
   sessionId: string
   // Short id of the background session, what `claude attach/stop` take (v1.0).
   agentId?: string
+  // Where its window was opened; only zellij needs it (no tab tags there).
+  mux?: Mux
   parentSessionId?: string
   cwd: string
   // Repo the vertical belongs to (git common dir, shared by worktrees); missing on old records.
@@ -103,8 +105,6 @@ const closeKey = (sessionId: string) => `close:${sessionId}`
 // The hub (mother chat) of a project: its session id.
 const hubKey = (project: string) => `hub:${project}`
 const CLOSE_DELAY_S = 5
-// What tmux and the claude CLI get from us inside a shell line: ids only.
-const SAFE = /^[@%\w-]+$/
 
 const slugify = (text: string) =>
   text
@@ -163,6 +163,125 @@ async function projectVerticals($: EngineInterface): Promise<Vertical[]> {
   return kept
 }
 
+// --- Multiplexer adapter ---
+
+// The terminal multiplexer the mod opens a vertical's window in: tmux or zellij.
+// One adapter, so register.tsx never names a multiplexer command.
+// A window is an opaque handle string: tmux `@5` (window id), zellij `zellij:<session>:<tabId>`.
+// tmux tags its windows (`@cv_id`); zellij has no tab options, so a zellij
+// vertical keeps its session and tab id in `Vertical.mux`.
+
+type Mux = { kind: 'tmux' | 'zellij'; session?: string; tabId?: number }
+
+// Ids only: what we put inside a detached shell line.
+const SAFE = /^[@%\w-]+$/
+
+const zellijHandle = (m: { session: string; tabId: number }) => `zellij:${m.session}:${m.tabId}`
+
+function parseZellij(handle: string): { session: string; tabId: number } | undefined {
+  const m = /^zellij:(.+):(\d+)$/.exec(handle)
+  return m ? { session: m[1], tabId: Number(m[2]) } : undefined
+}
+
+const zellij = ($: EngineInterface, session: string, ...action: string[]) =>
+  $.process.run(['zellij', '--session', session, 'action', ...action])
+
+// Where this chat runs. Both set (one inside the other): tmux, as before.
+async function muxDetect($: EngineInterface): Promise<Mux | undefined> {
+  if (await $.env.get('TMUX')) return { kind: 'tmux' }
+  const session = await $.env.get('ZELLIJ_SESSION_NAME')
+  if ((await $.env.get('ZELLIJ')) !== undefined && session) return { kind: 'zellij', session }
+  return undefined
+}
+
+// Opens a window running `claude attach <agentId>`; returns what to remember of it.
+async function muxOpen(
+  $: EngineInterface, mux: Mux, name: string, cwd: string, agentId: string, sessionId: string,
+): Promise<Mux | undefined> {
+  if (mux.kind === 'zellij' && mux.session) {
+    // --close-on-exit: leaving the attach (←) also closes the tab, like Nascondi.
+    const ran = await zellij($, mux.session, 'new-tab', '-n', name, '-c', cwd, '--close-on-exit', '--', 'claude', 'attach', agentId)
+    const tabId = /^\d+$/.test(ran.stdout.trim()) ? Number(ran.stdout.trim()) : undefined
+    if (ran.exitCode !== 0 || tabId === undefined) {
+      $.ui.log(`zellij new-tab failed: ${ran.stderr.slice(0, 200)}`, { to: 'debug' })
+      return undefined
+    }
+    return { kind: 'zellij', session: mux.session, tabId }
+  }
+  const ran = await $.process.run(['tmux', 'new-window', '-P', '-F', '#{window_id}', '-n', name, '-c', cwd, 'claude', 'attach', agentId])
+  const win = ran.stdout.trim()
+  if (ran.exitCode !== 0 || !win) {
+    $.ui.log(`tmux new-window failed: ${ran.stderr.slice(0, 200)}`, { to: 'debug' })
+    return undefined
+  }
+  await $.process.run(['tmux', 'set-option', '-w', '-t', win, '@cv_id', sessionId])
+  return { kind: 'tmux' }
+}
+
+// Open windows by session id. tmux: the tagged ones, in every tmux session.
+// zellij: the tab each record points to, if it still exists in its session.
+async function muxWindows($: EngineInterface, records: { sessionId: string; mux?: Mux }[]): Promise<Record<string, string>> {
+  const found: Record<string, string> = {}
+  const ran = await $.process.run(['tmux', 'list-windows', '-a', '-F', '#{window_id}\t#{@cv_id}']).catch(() => undefined)
+  if (ran && ran.exitCode === 0) {
+    for (const line of ran.stdout.split('\n')) {
+      const [win, id] = line.split('\t')
+      if (win && id) found[id] = win
+    }
+  }
+  const bySession = new Map<string, { sessionId: string; tabId: number }[]>()
+  for (const r of records) {
+    if (r.mux?.kind !== 'zellij' || !r.mux.session || r.mux.tabId === undefined) continue
+    bySession.set(r.mux.session, [...(bySession.get(r.mux.session) ?? []), { sessionId: r.sessionId, tabId: r.mux.tabId }])
+  }
+  for (const [session, list] of bySession) {
+    const tabs = await zellij($, session, 'list-tabs', '-j').catch(() => undefined)
+    if (!tabs || tabs.exitCode !== 0) continue
+    let ids: Set<number>
+    try {
+      ids = new Set((JSON.parse(tabs.stdout) as { tab_id: number }[]).map(t => t.tab_id))
+    } catch {
+      continue
+    }
+    for (const r of list) if (ids.has(r.tabId)) found[r.sessionId] = zellijHandle({ session, tabId: r.tabId })
+  }
+  return found
+}
+
+async function muxSelect($: EngineInterface, handle: string): Promise<boolean> {
+  const z = parseZellij(handle)
+  const ran = z ? await zellij($, z.session, 'go-to-tab-by-id', String(z.tabId)) : await $.process.run(['tmux', 'select-window', '-t', handle])
+  return ran.exitCode === 0
+}
+
+async function muxKill($: EngineInterface, handle: string): Promise<void> {
+  const z = parseZellij(handle)
+  if (z) await zellij($, z.session, 'close-tab-by-id', String(z.tabId))
+  else await $.process.run(['tmux', 'kill-window', '-t', handle])
+}
+
+// The same close as a shell step, for the detached line that outlives the vertical.
+function muxKillStep(handle: string): string | undefined {
+  const z = parseZellij(handle)
+  if (!z) return SAFE.test(handle) ? `tmux kill-window -t '${handle}'` : undefined
+  return SAFE.test(z.session) ? `zellij --session '${z.session}' action close-tab-by-id ${z.tabId}` : undefined
+}
+
+// The hub names its own window `hub`.
+async function muxRenameSelf($: EngineInterface, mux: Mux, name: string): Promise<void> {
+  if (mux.kind === 'tmux') {
+    const pane = await $.env.get('TMUX_PANE')
+    if (pane) await $.process.run(['tmux', 'rename-window', '-t', pane, name])
+    return
+  }
+  const pane = await $.env.get('ZELLIJ_PANE_ID')
+  if (!pane || !mux.session) return
+  const ran = await zellij($, mux.session, 'list-panes', '-j')
+  if (ran.exitCode !== 0) return
+  const own = (JSON.parse(ran.stdout) as { id: number; is_plugin: boolean; tab_id: number }[]).find(p => !p.is_plugin && String(p.id) === pane)
+  if (own) await zellij($, mux.session, 'rename-tab-by-id', String(own.tab_id), name)
+}
+
 // --- Running sessions and tmux windows ---
 
 async function listAgents($: EngineInterface): Promise<Live[]> {
@@ -176,17 +295,8 @@ async function listAgents($: EngineInterface): Promise<Live[]> {
   }
 }
 
-// Windows the mod tagged with `@cv_id <sessionId>`, in every tmux session.
-async function taggedWindows($: EngineInterface): Promise<Record<string, string>> {
-  const ran = await $.process.run(['tmux', 'list-windows', '-a', '-F', '#{window_id}\t#{@cv_id}']).catch(() => undefined)
-  const found: Record<string, string> = {}
-  if (!ran || ran.exitCode !== 0) return found
-  for (const line of ran.stdout.split('\n')) {
-    const [win, id] = line.split('\t')
-    if (win && id) found[id] = win
-  }
-  return found
-}
+// Open windows by vertical session id (tmux tags / zellij tab ids).
+const taggedWindows = async ($: EngineInterface) => muxWindows($, await allVerticals($))
 
 // Reads both and stores them for the pane; `changed` when anything moved.
 async function readLive($: EngineInterface) {
@@ -240,8 +350,6 @@ function launchPrompt(v: Vertical): string {
   )
 }
 
-const inTmux = async ($: EngineInterface) => Boolean(await $.env.get('TMUX'))
-
 // Starts the vertical as a background session; resolves its short id and uuid.
 // `--bg` picks the session id itself, so it is read back from `claude agents`.
 async function launch($: EngineInterface, v: Vertical): Promise<{ agentId: string; sessionId: string }> {
@@ -259,22 +367,21 @@ async function launch($: EngineInterface, v: Vertical): Promise<{ agentId: strin
   throw new Error(`sessione ${agentId} avviata ma non trovata in \`claude agents\``)
 }
 
-// Opens a tmux window attached to the vertical (by id, never by name: attach
-// also takes part of a name) and tags it with `@cv_id` to find it again.
+// Opens a window (tmux window / zellij tab) attached to the vertical (by id,
+// never by name: attach also takes part of a name), tagged to find it again.
 async function openWindow($: EngineInterface, v: Vertical): Promise<boolean> {
-  if (!v.agentId || !(await inTmux($))) return false
-  const ran = await $.process.run([
-    'tmux', 'new-window', '-P', '-F', '#{window_id}', '-n', windowName(v.title, v.pacaRef), '-c', v.cwd,
-    'claude', 'attach', v.agentId,
-  ])
-  const win = ran.stdout.trim()
-  if (ran.exitCode !== 0 || !win) {
-    $.ui.log(`tmux new-window failed: ${ran.stderr.slice(0, 200)}`, { to: 'debug' })
-    return false
+  const here = v.agentId ? await muxDetect($) : undefined
+  if (!v.agentId || !here) return false
+  const opened = await muxOpen($, here, windowName(v.title, v.pacaRef), v.cwd, v.agentId, v.sessionId)
+  if (!opened) return false
+  if (opened.kind === 'zellij') {
+    Object.assign(v, { mux: opened })
+    await $.store.set(verticalKey(v.sessionId), v)
   }
-  await $.process.run(['tmux', 'set-option', '-w', '-t', win, '@cv_id', v.sessionId])
   return true
 }
+
+const muxLabel = async ($: EngineInterface) => ((await muxDetect($))?.kind === 'zellij' ? 'tab zellij' : 'finestra tmux')
 
 const attachCommand = (v: Vertical) => (v.agentId ? `claude attach ${v.agentId}` : `claude --resume ${v.sessionId}`)
 
@@ -300,7 +407,7 @@ async function startHandoff($: EngineInterface, input: HandoffInput): Promise<st
     const opened = await openWindow($, existing)
     return (
       `Chat verticale «${existing.slug}» non raggiungibile: aggiornamento aggiunto al brief ${existing.briefPath}. ` +
-      (opened ? 'Riaperta in una finestra tmux.' : `Riaprila con \`${attachCommand(existing)}\`.`)
+      (opened ? `Riaperta in una ${await muxLabel($)}.` : `Riaprila con \`${attachCommand(existing)}\`.`)
     )
   }
 
@@ -338,7 +445,7 @@ async function startHandoff($: EngineInterface, input: HandoffInput): Promise<st
   void openPane($).catch(() => undefined)
   const opened = await openWindow($, v)
   const where = opened
-    ? `avviata in background e aperta nella finestra tmux «${windowName(v.title, v.pacaRef)}»`
+    ? `avviata in background e aperta nella ${await muxLabel($)} «${windowName(v.title, v.pacaRef)}»`
     : `avviata in background (\`claude attach ${v.agentId}\` per aprirla)`
   return (
     `Chat verticale «${v.slug}» ${where}. Brief: ${v.briefPath}. ` +
@@ -364,8 +471,8 @@ async function claimHub($: EngineInterface) {
     // A command cannot run inside a hook the turn waits on: queue it.
     $.clock.after(1000, () => void $.command.run({ command: 'rename', args: name }).catch(() => undefined))
   }
-  const pane = await $.env.get('TMUX_PANE')
-  if (pane) await $.process.run(['tmux', 'rename-window', '-t', pane, 'hub']).catch(() => undefined)
+  const here = await muxDetect($)
+  if (here) await muxRenameSelf($, here, 'hub').catch(() => undefined)
 }
 
 // Old mothers that are gone (not running, not a vertical themselves) hand their
@@ -696,8 +803,8 @@ async function finishVertical(
     : ''
   await $.store.set(closeKey(v.sessionId), status)
   const close = status === 'done'
-    ? ' A fine turno la finestra tmux di questa chat si chiude e la sessione si ferma: completa ora, in questo turno, ciò che resta (PACA compreso) e non fare domande all\'utente.'
-    : v.agentId ? ' A fine turno la finestra tmux si chiude; la sessione resta viva e si riapre dall\'hub.' : ''
+    ? ' A fine turno la finestra (tab) di questa chat si chiude e la sessione si ferma: completa ora, in questo turno, ciò che resta (PACA compreso) e non fare domande all\'utente.'
+    : v.agentId ? ' A fine turno la finestra (tab) si chiude; la sessione resta viva e si riapre dall\'hub.' : ''
   return `Verticale «${v.slug}» segnata ${status}; ${parentNote}.${paca}${close}`
 }
 
@@ -751,7 +858,8 @@ async function relink($: EngineInterface, oldId: string) {
 async function closeBackground($: EngineInterface, v: Vertical, stop: boolean) {
   const win = (await taggedWindows($))[v.sessionId]
   const steps = [`sleep ${CLOSE_DELAY_S}`]
-  if (win && SAFE.test(win)) steps.push(`tmux kill-window -t '${win}'`)
+  const kill = win && muxKillStep(win)
+  if (kill) steps.push(kill)
   if (stop && v.agentId && SAFE.test(v.agentId)) steps.push(`claude stop '${v.agentId}'`)
   if (steps.length === 1) return false
   const ran = await $.process.run(['setsid', '-f', 'sh', '-c', `exec >/dev/null 2>&1; ${steps.join('; ')}`])
@@ -782,14 +890,14 @@ async function goTo($: EngineInterface, v: Vertical) {
     await $.ui.copy({ text: command })
     $.ui.toast(`${why}: copiato "${command}"`)
   }
-  if (!(await inTmux($))) return offer('Fuori da tmux')
+  if (!(await muxDetect($))) return offer('Fuori da tmux/zellij')
   if (!v.agentId) {
     const ran = await $.process.run(['tmux', 'select-window', '-t', v.slug])
     if (ran.exitCode !== 0) await offer(`Finestra «${v.slug}» non trovata`)
     return
   }
   const win = (await taggedWindows($))[v.sessionId]
-  if (win && (await $.process.run(['tmux', 'select-window', '-t', win])).exitCode === 0) return
+  if (win && (await muxSelect($, win))) return
   if (v.status === 'paused') await $.store.set(verticalKey(v.sessionId), { ...v, status: 'active' })
   if (!(await openWindow($, v))) return offer('Finestra non aperta')
   await refresh($)
@@ -800,7 +908,7 @@ async function hide($: EngineInterface, v: Vertical) {
   if (!v.agentId) return $.ui.toast(`«${v.slug}» è una verticale v0.3: non si può nascondere`)
   const win = (await taggedWindows($))[v.sessionId]
   if (!win) return $.ui.toast(`«${v.slug}» è già nascosta`)
-  await $.process.run(['tmux', 'kill-window', '-t', win])
+  await muxKill($, win)
   await refresh($)
 }
 
@@ -810,7 +918,7 @@ async function stopVertical($: EngineInterface, v: Vertical) {
   const ok = await $.ui.ask(`Fermo la sessione di «${v.title}»? La cronologia resta.`, { header: 'Stop', options: ['Sì, ferma', 'No'] })
   if (ok !== 'Sì, ferma') return
   const win = (await taggedWindows($))[v.sessionId]
-  if (win) await $.process.run(['tmux', 'kill-window', '-t', win])
+  if (win) await muxKill($, win)
   const ran = await $.process.run(['claude', 'stop', v.agentId])
   $.ui.toast(ran.exitCode === 0 ? `Fermata «${v.slug}»` : `Stop non riuscito: ${(ran.stderr || ran.stdout).trim().slice(0, 120)}`)
   await refresh($)
@@ -828,7 +936,7 @@ async function closeVertical($: EngineInterface, v: Vertical) {
   if (sent.isDelivered) return $.ui.toast(`Chiesto a «${v.slug}» di chiudersi`)
   await $.store.set(verticalKey(v.sessionId), { ...v, status: 'done' })
   const win = (await taggedWindows($))[v.sessionId]
-  if (win) await $.process.run(['tmux', 'kill-window', '-t', win])
+  if (win) await muxKill($, win)
   if (v.agentId) await $.process.run(['claude', 'stop', v.agentId])
   $.ui.toast(`«${v.slug}» non raggiungibile: segnata chiusa senza riepilogo`)
   await bump($)
@@ -879,7 +987,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: TOOL_HANDOFF,
       description:
-        'Passa il contesto a una NUOVA chat verticale (sessione in background, aperta in una finestra tmux) specializzata su un task PACA, un argomento o una funzione. ' +
+        'Passa il contesto a una NUOVA chat verticale (sessione in background, aperta in una finestra tmux o tab zellij) specializzata su un task PACA, un argomento o una funzione. ' +
         'Usalo solo dopo averlo proposto all\'utente; il tool chiede conferma. Se esiste già una chat attiva con lo stesso slug, la riusa. ' +
         'Il brief deve essere autosufficiente (la nuova chat non vede questa conversazione).',
       isDeferred: false,
@@ -887,7 +995,7 @@ export const register: Register = on => {
         type: 'object',
         properties: {
           slug: { type: 'string', description: 'Identificativo tecnico breve: `ACME-42-fix-x` per un task PACA, `area-funzione` altrimenti.' },
-          title: { type: 'string', description: 'Titolo leggibile e breve del verticale: diventa il nome della sessione e della finestra tmux.' },
+          title: { type: 'string', description: 'Titolo leggibile e breve del verticale: diventa il nome della sessione e della finestra o tab.' },
           scope: { type: 'string', description: 'Confini: cosa rientra in questa chat e cosa no.' },
           brief: { type: 'string', description: 'Markdown: obiettivo e criterio di fatto, decisioni prese, stato, file/branch/worktree, ID PACA, domande aperte, regole del repo, cosa NON fare.' },
           paca_task_id: { type: 'string', description: 'UUID del task PACA, se c\'è.' },
