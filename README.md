@@ -1,6 +1,6 @@
 # chat-verticali
 
-Una mod di Claude Code (plugin con hooks module TypeScript) per lavorare a "chat verticali": una chat per ogni task PACA, argomento o funzione di un repo. Quando il lavoro cambia verticale, o il contesto si riempie, la chat corrente passa il testimone a una nuova chat con un brief scritto per bastare da solo; a lavoro finito la nuova chat riporta il risultato alla chat madre. Versione 1.0.0.
+Una mod di Claude Code (plugin con hooks module TypeScript) per lavorare a "chat verticali": una chat per ogni task PACA, argomento o funzione di un repo. Quando il lavoro cambia verticale, o il contesto si riempie, la chat corrente passa il testimone a una nuova chat con un brief scritto per bastare da solo; a lavoro finito la nuova chat riporta il risultato alla chat madre. Versione 1.1.0.
 
 Nasce da un'abitudine pratica: una chat lunga e che salta tra più cose si degrada. Meglio chat corte e mirate, e un passaggio di consegne esplicito.
 
@@ -105,6 +105,22 @@ In una chat verticale la status line mostra `⟂ <slug>`. Le finestre tmux, con 
 
 La sessione tmux per progetto la apre l'utente: la mod non crea sessioni tmux e non tocca le opzioni globali.
 
+### zellij
+
+Dalla 1.1 la mod lavora anche in zellij (**0.45.1 verificato**: servono le azioni `*-by-id` e `list-tabs -j`; versioni precedenti non provate). Si rileva da `$ZELLIJ` e `$ZELLIJ_SESSION_NAME`; se sono presenti sia tmux sia zellij vince tmux.
+
+| Azione | tmux | zellij |
+|---|---|---|
+| Apri | `new-window` + opzione `@cv_id` | `action new-tab -n <nome> -c <cwd> --close-on-exit -- claude attach <id>` |
+| Vai | `select-window` | `action go-to-tab-by-id` |
+| Nascondi / chiusura a done | `kill-window` | `action close-tab-by-id` |
+| Rinomina l'hub | `rename-window` | `action rename-tab-by-id` (tab trovata da `$ZELLIJ_PANE_ID` con `list-panes -j`) |
+
+- zellij non ha opzioni sulle tab: l'id della tab è salvato nel record della verticale (`mux: { kind, session, tabId }`) e l'hub la considera aperta solo se `list-panes -j -t -c` mostra in quella tab un pane non plugin con `claude attach <id>` (zellij riusa gli id delle tab liberate: una tab estranea sullo stesso id non si tocca mai).
+- `--close-on-exit`: uscire da `claude attach` (←) chiude la tab, come Nascondi; la sessione resta viva.
+- La chiusura a `done` parte dalla sessione in background, che non ha `$ZELLIJ`: usa `zellij --session <sessione del record> action ...`.
+- Limite: le tab si rilevano solo nella sessione zellij in cui sono state aperte. La mod non crea sessioni zellij né tocca `config.kdl`.
+
 ## Flusso: madre, verticale, ritorno
 
 ```
@@ -156,7 +172,7 @@ claude plugin install chat-verticali@gorlix-chat-verticali
 
 Poi, nella sessione già aperta, `/reload-plugins`. Il plugin è letto dalla cartella: dopo ogni modifica al codice basta di nuovo `/reload-plugins`, ma alza la versione in `plugin.json` a ogni rilascio, altrimenti resta in uso la copia in cache.
 
-Requisiti: Claude Code 2.1.318 o successivo (`claude --bg`, `claude agents --json`, `claude attach`, `claude stop`), `claude` e `setsid` nel PATH, `tmux` consigliato (senza, le verticali partono comunque in background e si aprono con `claude attach <id>`). PACA è facoltativo: senza, `paca_task_id` e `paca_ref` restano vuoti.
+Requisiti: Claude Code 2.1.318 o successivo (`claude --bg`, `claude agents --json`, `claude attach`, `claude stop`), `claude` e `setsid` nel PATH, `tmux` o `zellij` consigliato (senza, le verticali partono comunque in background e si aprono con `claude attach <id>`). PACA è facoltativo: senza, `paca_task_id` e `paca_ref` restano vuoti.
 
 ## Sviluppo
 
