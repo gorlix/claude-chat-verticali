@@ -1,5 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
+import { attention, cutWords, sessionName, windowName } from '../hooks/panel'
+
 const composeInput = {
   model: 'claude-sonnet-5-5',
   promptModel: 'claude-sonnet-5-5',
@@ -80,29 +82,51 @@ test('moving a second PACA task adds a handoff reminder', async ($, on) => {
 const pane = {
   plugin: 'chat-verticali', surface: 'terminal', component: 'Pane', requestId: 'verticali', props: {},
 } as never
+const widePane = { ...(pane as object), props: { bodyColumns: 90 } } as never
 const v = (id: string, over: object = {}) => ({
   ...vertical, slug: `slug-${id}`, title: `Titolo ${id}`, sessionId: id, ...over,
 })
 const runOk = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 
-test('the pane groups verticals, shows ref, context bar and relations', async ($, on) => {
+// A `process.run` answer for the hub: `claude agents --json` and the tagged windows.
+const hubRun = (live: object[], windows: Record<string, string>, runs: string[][] = [], other?: (argv: string[]) => unknown) =>
+  (argv: string[]) => {
+    runs.push(argv)
+    if (argv[0] === 'claude' && argv[1] === 'agents') return { ...runOk, stdout: JSON.stringify(live) }
+    if (argv[1] === 'list-windows') return { ...runOk, stdout: Object.entries(windows).map(([id, w]) => `${w}\t${id}`).join('\n') }
+    return other?.(argv) ?? runOk
+  }
+
+test('the hub draws a tree by attention, with ref, context, glyphs and Nascondi', async ($, on) => {
   mock.store(on, {
-    'v:a': v('a', { pacaRef: 'HOME-16', contextPercent: 72, parentSessionId: 'main' }),
-    'v:b': v('b', { status: 'paused' }),
-    'v:c': v('c', { status: 'done', contextPercent: 90 }),
+    'v:a': v('a', { agentId: 'aa', parentSessionId: 'main', pacaRef: 'HOME-16', contextPercent: 72, createdAt: '2026-10-01' }),
+    'v:c': v('c', { agentId: 'cc', parentSessionId: 'a' }),
+    'v:b': v('b', { agentId: 'bb', parentSessionId: 'main', createdAt: '2026-10-09' }),
+    'v:p': v('p', { agentId: 'pp', parentSessionId: 'main', status: 'paused' }),
+    'v:d': v('d', { status: 'done', contextPercent: 90 }),
   })
-  on('session.id', () => ({ value: 'a' }))
-  here(on)
-  const ui = await $.ui.mount(pane)
-  expect(await ui.findAll({ type: 'Text', text: /Attive \(1\)/ })).toHaveLength(1)
-  expect(await ui.findAll({ type: 'Text', text: /In pausa \(1\)/ })).toHaveLength(1)
+  on('session.id', () => ({ value: 'main' }))
+  here(on, '/tmp', hubRun(
+    [
+      { sessionId: 'a', id: 'aa', kind: 'background', status: 'waiting', waitingFor: 'permission prompt' },
+      { sessionId: 'c', id: 'cc', kind: 'background', status: 'busy', state: 'working' },
+      { sessionId: 'b', id: 'bb', kind: 'background', status: 'idle' },
+    ],
+    { a: '@5' },
+  ))
+  const ui = await $.ui.mount(widePane)
+  expect(await ui.findAll({ type: 'Text', text: /Verticali \(4\)/ })).toHaveLength(1)
   expect(await ui.findAll({ type: 'Text', text: /Chiuse \(1\)/ })).toHaveLength(1)
   expect(await ui.findAll({ type: 'Text', text: /HOME-16/ })).toHaveLength(1)
-  expect(await ui.findAll({ type: 'Text', text: /\(questa\)/ })).toHaveLength(1)
   expect(await ui.findAll({ type: 'Text', text: /72%/ })).not.toHaveLength(0)
-  // The done one shows no percentage; the current session has no "Vai" for itself.
   expect(await ui.findAll({ type: 'Text', text: /90%/ })).toHaveLength(0)
-  expect(await ui.findAll({ type: 'Button', text: /Vai/ })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Text', text: /└/ })).toHaveLength(1)
+  // a asks (?) and comes first, though older than b; b has no window: hidden.
+  const glyphs = (await ui.findAll({ type: 'Text', text: /^[?◆●○▫◐✓] $/ })).map(t => String(t.text).trim())
+  expect(glyphs).toEqual(['?', '●', '▫', '◐', '✓'])
+  // Only the vertical with an open window can be hidden from its row.
+  expect(await ui.findAll({ type: 'Button', key: 'hide-a' })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Button', key: 'hide-b' })).toHaveLength(0)
 })
 
 test('only the latest 5 closed verticals are listed', async ($, on) => {
@@ -113,8 +137,8 @@ test('only the latest 5 closed verticals are listed', async ($, on) => {
   here(on)
   const ui = await $.ui.mount(pane)
   expect(await ui.findAll({ type: 'Text', text: /ultime 5 di 7/ })).toHaveLength(1)
-  expect(await ui.findAll({ type: 'Text', text: /slug-d7/ })).not.toHaveLength(0)
-  expect(await ui.findAll({ type: 'Text', text: /slug-d1\b/ })).toHaveLength(0)
+  expect(await ui.findAll({ type: 'Text', text: /Titolo d7/ })).not.toHaveLength(0)
+  expect(await ui.findAll({ type: 'Text', text: /Titolo d1\b/ })).toHaveLength(0)
 })
 
 test('Vai selects the tmux window of the vertical', async ($, on) => {
@@ -128,7 +152,7 @@ test('Vai selects the tmux window of the vertical', async ($, on) => {
   })
   const ui = await $.ui.mount(pane)
   await ui.press({ key: 'go-b' })
-  expect(runs).toEqual([['tmux', 'select-window', '-t', 'slug-b']])
+  expect(runs.filter(r => r[1] === 'select-window')).toEqual([['tmux', 'select-window', '-t', 'slug-b']])
 })
 
 test('Vai on a missing window, or outside tmux, copies the resume command', async ($, on) => {
@@ -219,9 +243,9 @@ test('the pane and /verticali hide the verticals of other projects', async ($, o
   here(on, '/repo/a')
   on('ui.open', () => ({ value: { isPlaced: true } }))
   const ui = await $.ui.mount(pane)
-  for (const slug of ['slug-mine', 'slug-wt', 'slug-old', 'slug-child'])
-    expect(await ui.findAll({ type: 'Text', text: new RegExp(slug) })).not.toHaveLength(0)
-  expect(await ui.findAll({ type: 'Text', text: /slug-other/ })).toHaveLength(0)
+  for (const id of ['mine', 'wt', 'old', 'child'])
+    expect(await ui.findAll({ type: 'Button', key: `go-${id}` })).toHaveLength(1)
+  expect(await ui.findAll({ type: 'Button', key: 'go-other' })).toHaveLength(0)
 
   const listed = await $.command.run({ command: 'verticali', args: '' } as never)
   expect(listed.text).not.toContain('slug-other')
@@ -261,7 +285,7 @@ test('vertical_done (done) closes its own tmux pane when the turn ends', async (
   const { runs, toasts, data } = doneSetup(on, { delivered: true, pane: '%7', start: 'claude -n slug-a --session-id a ...' })
   on('turn.complete', ($, e) => ({ text: (e as { answer: string }).answer }))
   const ran = await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)
-  expect(ran.result).toContain('si chiude da sola')
+  expect(ran.result).toContain('si chiude e la sessione si ferma')
   expect(runs).toEqual([])
   await $.turn.complete(turnEnd())
   expect(runs[1]).toEqual(['tmux', 'run-shell', '-b', "sleep 5; tmux -S '/tmp/tmux-1000/default' kill-pane -t '%7'"])
@@ -287,7 +311,7 @@ test('an interrupted turn does not close the pane yet', async ($, on) => {
   await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)
   await $.turn.complete(turnEnd('aborted'))
   expect(runs).toEqual([])
-  expect(data.get('close:a')).toBe(true)
+  expect(data.get('close:a')).toBe('done')
 })
 
 test('a summary the mother cannot receive waits in her inbox', async ($, on) => {
@@ -315,4 +339,177 @@ test('after a /clear the children follow the mother to her new id', async ($, on
   expect((data.get('v:c2') as { parentSessionId: string }).parentSessionId).toBe('elsewhere')
   expect(data.get('inbox:new')).toEqual(['esito c0'])
   expect(data.has('inbox:old')).toBe(false)
+})
+
+// --- v1.0: background sessions, hub, names ---
+
+// Answers each ask with the first "Sì, …" option it offers.
+const sayYes = (on: Parameters<typeof mock.store>[0]) =>
+  on('tool.call', { tool: 'AskUserQuestion' }, (_$, e) => {
+    const q = (e as unknown as { questions: { question: string }[] }).questions[0].question
+    return { result: { answers: { [q]: JSON.stringify(e).match(/Sì, \w+/)?.[0] } } }
+  })
+
+test('names: session "<REF>: <Title>", window cut at a word end within 20', async () => {
+  expect(sessionName('Pannello verticali', 'HOME-16')).toBe('HOME-16: Pannello verticali')
+  expect(sessionName(' Solo titolo ')).toBe('Solo titolo')
+  expect(windowName('Pannello verticali con hub e parcheggio', 'HOME-16')).toBe('HOME-16: Pannello verticali')
+  expect(windowName('Riordino')).toBe('Riordino')
+  expect(cutWords('Supercalifragilistichespiralidoso', 20)).toBe('Supercalifragilistic')
+})
+
+test('attention: permission asks first, then input, busy, open, hidden', async () => {
+  const bg = { ...vertical, status: 'active' as const, agentId: 'aa' }
+  expect(attention(bg, { sessionId: 'x', status: 'waiting', waitingFor: 'permission prompt' }, true)).toBe('ask')
+  expect(attention(bg, { sessionId: 'x', status: 'waiting', waitingFor: 'input needed' }, true)).toBe('input')
+  expect(attention(bg, { sessionId: 'x', status: 'busy' }, false)).toBe('busy')
+  expect(attention(bg, { sessionId: 'x', status: 'idle' }, true)).toBe('open')
+  expect(attention(bg, undefined, false)).toBe('hidden')
+  // A v0.3 vertical, alive, counts as open though no window carries the tag.
+  expect(attention({ ...vertical, status: 'active' }, { sessionId: 'x', status: 'idle' }, false)).toBe('open')
+  expect(attention({ ...bg, status: 'done' }, { sessionId: 'x', status: 'busy' }, true)).toBe('done')
+})
+
+test('handoff starts a background session, attaches it in a tagged window and makes the mother the hub', async ($, on) => {
+  const data = spyStore(on, {})
+  const runs: string[][] = []
+  const renamed: string[] = []
+  const clock = mock.clock(on, { now: 1_760_000_000_000 })
+  on('session.id', () => ({ value: 'main' }))
+  on('env.get', (_$, e) => ({ value: ({ TMUX: '/tmp/tmux,1,0', TMUX_PANE: '%0', HOME: '/home/x' } as Record<string, string>)[(e as { name: string }).name] }))
+  on('fs.write', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('command.run', { command: 'rename' }, (_$, e) => ({ text: void renamed.push((e as { args: string }).args) }))
+  sayYes(on)
+  here(on, '/tmp', hubRun(
+    [{ sessionId: 'uuid-1', id: 'ab12cd34', name: 'HOME-16: Pannello verticali con hub e parcheggio' }, { sessionId: 'main', name: 'chat' }],
+    {}, runs,
+    argv => argv[1] === '--bg' ? { ...runOk, stdout: 'backgrounded · ab12cd34 · HOME-16: Pannello…\n' }
+      : argv[1] === 'new-window' ? { ...runOk, stdout: '@9\n' } : runOk,
+  ))
+  const ran = await $.tool.call({
+    tool: 'mcp__chat-verticali__handoff', slug: 'home-16-pannello', title: 'Pannello verticali con hub e parcheggio',
+    scope: 's', brief: 'b', paca_ref: 'HOME-16',
+  } as never)
+  expect(ran.result).toContain('aperta nella finestra tmux «HOME-16: Pannello verticali»')
+  const bg = runs.find(r => r[1] === '--bg')!
+  expect(bg.slice(0, 6)).toEqual(['claude', '--bg', '-n', 'HOME-16: Pannello verticali con hub e parcheggio', '--model', 'sonnet'])
+  const win = runs.find(r => r[1] === 'new-window')!
+  expect(win.slice(-3)).toEqual(['claude', 'attach', 'ab12cd34'])
+  expect(win).toContain('HOME-16: Pannello verticali')
+  expect(runs).toContainEqual(['tmux', 'set-option', '-w', '-t', '@9', '@cv_id', 'uuid-1'])
+  expect(data.get('v:uuid-1')).toMatchObject({ agentId: 'ab12cd34', sessionId: 'uuid-1', parentSessionId: 'main' })
+  expect(data.get('hub:/tmp')).toBe('main')
+  expect(runs).toContainEqual(['tmux', 'rename-window', '-t', '%0', 'hub'])
+  await clock.advance(1000)
+  expect(renamed).toEqual(['hub-tmp'])
+})
+
+test('a failed background start reports why and registers nothing', async ($, on) => {
+  const data = spyStore(on, {})
+  on('session.id', () => ({ value: 'main' }))
+  on('env.get', () => ({ value: undefined }))
+  on('fs.write', () => ({ value: undefined }))
+  sayYes(on)
+  on('clock.now', () => ({ value: 1_760_000_000_000 }))
+  here(on, '/tmp', argv => argv[1] === '--bg' ? { ...runOk, exitCode: 1, stdout: 'Workspace not trusted.' } : runOk)
+  const ran = await $.tool.call({ tool: 'mcp__chat-verticali__handoff', slug: 'x', title: 'X', scope: 's', brief: 'b' } as never)
+  expect(ran.result).toContain('Workspace not trusted')
+  expect([...data.keys()].filter(k => k.startsWith('v:'))).toEqual([])
+})
+
+test('hub keys: Vai selects or opens by id, Nascondi kills the window, Stop and Chiudi confirm', async ($, on) => {
+  const runs: string[][] = []
+  const sent: string[] = []
+  mock.store(on, {
+    'v:a': v('a', { agentId: 'aa', parentSessionId: 'main' }),
+    'v:b': v('b', { agentId: 'bb', parentSessionId: 'main' }),
+  })
+  on('session.id', () => ({ value: 'main' }))
+  on('env.get', () => ({ value: '/tmp/tmux' }))
+  on('session.send', (_$, e) => ({ isDelivered: Boolean(sent.push(JSON.stringify(e))) }))
+  on('ui.toast', () => ({ value: undefined }))
+  sayYes(on)
+  here(on, '/tmp', hubRun([{ sessionId: 'a', id: 'aa', status: 'idle' }, { sessionId: 'b', id: 'bb', status: 'idle' }], { a: '@5' }, runs,
+    argv => argv[1] === 'new-window' ? { ...runOk, stdout: '@7\n' } : runOk))
+  const ui = await $.ui.mount(widePane)
+  const acts = () => runs.filter(r => !['agents', 'list-windows'].includes(r[1]))
+
+  await ui.press({ key: 'go-a' })
+  expect(acts()).toEqual([['tmux', 'select-window', '-t', '@5']])
+  runs.length = 0
+  await ui.press({ key: 'go-b' })
+  expect(acts()[0]).toEqual(['tmux', 'new-window', '-P', '-F', '#{window_id}', '-n', 'Titolo b', '-c', '/tmp', 'claude', 'attach', 'bb'])
+  expect(acts()[1]).toEqual(['tmux', 'set-option', '-w', '-t', '@7', '@cv_id', 'b'])
+  runs.length = 0
+  await ui.press({ key: 'hide-a' })
+  expect(acts()).toEqual([['tmux', 'kill-window', '-t', '@5']])
+  // The hotkeys act on the first row when no row has the focus: a (open) before b (hidden).
+  runs.length = 0
+  await ui.press({ key: 'k-stop' })
+  expect(acts()).toEqual([['tmux', 'kill-window', '-t', '@5'], ['claude', 'stop', 'aa']])
+  await ui.press({ key: 'k-close' })
+  expect(sent).toHaveLength(1)
+  expect(sent[0]).toContain('"to":"a"')
+  expect(sent[0]).toContain('vertical_done')
+})
+
+const bgDone = (on: Parameters<typeof mock.store>[0]) => {
+  const data = spyStore(on, { 'v:a': v('a', { agentId: 'aa', parentSessionId: 'mother', briefPath: '/tmp/a.md' }) })
+  const runs: string[][] = []
+  on('session.id', () => ({ value: 'a' }))
+  on('session.usage', () => ({ value: { context: {} } }))
+  on('clock.now', () => ({ value: 1_760_000_000_000 }))
+  on('fs.read', () => ({ value: '# brief\n' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('env.get', () => ({ value: undefined }))
+  on('session.send', () => ({ isDelivered: true }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('turn.complete', ($, e) => ({ text: (e as { answer: string }).answer }))
+  here(on, '/tmp', hubRun([], { a: '@5' }, runs))
+  return { data, runs }
+}
+
+test('a background vertical, done: its window closes and the session stops, detached', async ($, on) => {
+  const { runs } = bgDone(on)
+  await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)
+  await $.turn.complete(turnEnd())
+  expect(runs.find(r => r[0] === 'setsid')).toEqual(['setsid', '-f', 'sh', '-c', "exec >/dev/null 2>&1; sleep 5; tmux kill-window -t '@5'; claude stop 'aa'"])
+})
+
+test('a background vertical, paused: the window closes, the session stays alive', async ($, on) => {
+  const { runs, data } = bgDone(on)
+  const ran = await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok', status: 'paused' } as never)
+  expect(ran.result).toContain('resta viva')
+  await $.turn.complete(turnEnd())
+  expect(runs.find(r => r[0] === 'setsid')).toEqual(['setsid', '-f', 'sh', '-c', "exec >/dev/null 2>&1; sleep 5; tmux kill-window -t '@5'"])
+  expect(data.has('close:a')).toBe(false)
+})
+
+test('the hub adopts the open children and the inbox of a mother that is gone', async ($, on) => {
+  const data = spyStore(on, {
+    'hub:/tmp': 'main',
+    'v:x': v('x', { agentId: 'xx', parentSessionId: 'gone' }),
+    'v:y': v('y', { agentId: 'yy', parentSessionId: 'alive' }),
+    'v:z': v('z', { status: 'done', parentSessionId: 'gone' }),
+    'v:s': v('s', { agentId: 'ss', parentSessionId: 'x' }),
+    'inbox:gone': ['esito'],
+  })
+  const clock = mock.clock(on, { now: 1_760_000_000_000 })
+  on('session.id', () => ({ value: 'main' }))
+  on('env.get', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  here(on, '/tmp', hubRun([{ sessionId: 'alive' }, { sessionId: 'y' }], {}))
+  on('tool.register', () => ({ value: undefined }))
+  on('session.start', (_$, e) => e as never)
+  on('command.register', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  await $.session.start({ source: 'startup', cwd: '/tmp', surface: null, isInteractive: true } as never)
+  await clock.advance(3000)
+  expect((data.get('v:x') as { parentSessionId: string }).parentSessionId).toBe('main')
+  expect((data.get('v:y') as { parentSessionId: string }).parentSessionId).toBe('alive')
+  expect((data.get('v:z') as { parentSessionId: string }).parentSessionId).toBe('gone')
+  // x is a vertical, stopped or not: its child stays with it.
+  expect((data.get('v:s') as { parentSessionId: string }).parentSessionId).toBe('x')
+  expect(data.get('inbox:main')).toEqual(['esito'])
 })

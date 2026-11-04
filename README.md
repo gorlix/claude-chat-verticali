@@ -1,20 +1,25 @@
 # chat-verticali
 
-Una mod di Claude Code (plugin con hooks module TypeScript) per lavorare a "chat verticali": una chat per ogni task PACA, argomento o funzione di un repo. Quando il lavoro cambia verticale, o il contesto si riempie, la chat corrente passa il testimone a una nuova chat in una finestra tmux, con un brief scritto per bastare da solo; a lavoro finito la nuova chat riporta il risultato alla chat madre. Versione 0.3.0.
+Una mod di Claude Code (plugin con hooks module TypeScript) per lavorare a "chat verticali": una chat per ogni task PACA, argomento o funzione di un repo. Quando il lavoro cambia verticale, o il contesto si riempie, la chat corrente passa il testimone a una nuova chat con un brief scritto per bastare da solo; a lavoro finito la nuova chat riporta il risultato alla chat madre. Versione 1.0.0.
 
 Nasce da un'abitudine pratica: una chat lunga e che salta tra più cose si degrada. Meglio chat corte e mirate, e un passaggio di consegne esplicito.
 
+Dalla 1.0 ogni verticale è una **sessione in background** (`claude --bg`): in tmux la sua finestra è solo un `claude attach <id>`. Chiudere la finestra (Nascondi) non ferma la chat: resta "parcheggiata" e si riapre dall'**hub**, il pannello della chat madre nella finestra 0.
+
 ## Funzioni
 
-- **Handoff con brief.** Il tool `handoff` salva un brief in `~/.claude/handoffs/<slug>.md` (obiettivo, scope, decisioni, stato, file, task PACA, cosa non fare), registra la chat verticale e apre una nuova chat in una finestra tmux (`tmux new-window -n <slug>`), con il modello scelto (`sonnet` di default; `haiku`, `opus`, `fable` a richiesta). Il prompt iniziale le dice di leggere il brief e di confermare in tre righe obiettivo, stato e prossimo passo prima di procedere. Prima di aprire, il tool chiede conferma all'utente.
-- **Fuori da tmux.** Se non si è in tmux, o `tmux new-window` fallisce, la chat parte in background (`claude --bg`) e il risultato indica `claude attach <sessione>` per aprirla.
-- **Registro.** Ogni verticale è un record nello store del plugin (chiave `v:<sessionId>`): slug, titolo, scope, sessione e sessione madre, cartella, modello, percorso del brief, task PACA, stato (`active`, `paused`, `done`), data di creazione e percentuale di contesto.
-- **Riuso.** Se esiste già una verticale non chiusa con lo stesso slug, il tool chiede se riusarla. In caso affermativo manda il nuovo brief come messaggio alla chat in esecuzione; se non è raggiungibile, lo aggiunge in coda al file del brief (sezione `Aggiornamento`) e la riprende con `claude --resume`.
-- **Ritorno alla madre.** Con il tool `vertical_done` la verticale scrive l'esito in coda al proprio brief (`## Esito`), si segna `done` o `paused` e manda il riepilogo alla chat madre. Se la madre non è raggiungibile (chiusa) il riepilogo resta nel brief e va nella sua casella (`inbox:<sessionId>` nello store): le viene consegnato, con un toast, appena si riapre. Se la madre fa `/clear` e continua con un nuovo session id, le figlie (e la casella) vengono ricollegate al nuovo id. Se c'è un task PACA, la chat viene istruita a commentarlo e ad aggiornarne lo stato.
-- **Chiusura automatica.** Con `vertical_done` in stato `done`, a fine turno (non se interrotto) la mod chiude il pane tmux della verticale dopo 5 secondi, per lasciar leggere l'ultima risposta. Chiude solo un pane aperto dalla mod per quella chat (il suo comando di avvio contiene il session id), mai una shell dove la chat è stata ripresa a mano: lì un toast suggerisce `/exit`. `paused` non chiude.
+- **Handoff con brief.** Il tool `handoff` salva un brief in `~/.claude/handoffs/<slug>.md` (obiettivo, scope, decisioni, stato, file, task PACA, cosa non fare), avvia la verticale con `claude --bg -n <nome> --model <modello> "<prompt>"` (`sonnet` di default; `haiku`, `opus`, `fable` a richiesta) e la registra. Il prompt iniziale le dice di leggere il brief e di confermare in tre righe obiettivo, stato e prossimo passo. Prima di aprire, il tool chiede conferma all'utente.
+- **Finestra tmux.** In tmux la mod apre `tmux new-window -n <nome breve> -c <cwd> claude attach <id>` e marca la finestra con l'opzione `@cv_id <sessionId>`, che serve a ritrovarla. Si apre sempre per id, mai per nome (`claude attach` accetta anche una parte del nome). Fuori da tmux il risultato indica `claude attach <id>`.
+- **Nomi.** Con un task PACA la sessione si chiama `<REF>: <Titolo>` (per esempio `HOME-16: Pannello verticali`) e la finestra `<REF>: <titolo breve>`, con il titolo tagliato a fine parola entro 20 caratteri. Senza PACA, sessione e finestra prendono il titolo (breve). Lo slug resta l'identificativo tecnico: nome del brief, registro, univocità.
+- **Hub.** La chat madre del progetto è l'hub: la chiave `hub:<progetto>` dello store punta alla sua sessione. Al primo handoff, o con `/verticali`, una chat normale diventa hub. Se non si chiama già `hub-*`, la mod la rinomina `hub-<repo>` con `/rename` e rinomina la sua finestra tmux in `hub`. Se c'è già un altro hub vivo nel progetto, la chat resta una madre delle sole sue figlie.
+- **Registro.** Ogni verticale è un record nello store del plugin (chiave `v:<sessionId>`): slug, titolo, scope, sessione e id corto (`agentId`), sessione madre, cartella e progetto, modello, brief, task PACA, stato (`active`, `paused`, `done`), data di creazione, percentuale di contesto e ultima attività. `claude --bg` sceglie da sé il session id: la mod lo legge da `claude agents --json` dopo l'avvio.
+- **Riuso.** Se esiste già una verticale non chiusa con lo stesso slug, il tool chiede se riusarla. In caso affermativo manda il nuovo brief come messaggio alla chat; se non è raggiungibile, lo aggiunge in coda al brief (sezione `Aggiornamento`) e riapre la finestra con `claude attach`.
+- **Ritorno alla madre.** Con il tool `vertical_done` la verticale scrive l'esito in coda al proprio brief (`## Esito`), si segna `done` o `paused` e manda il riepilogo alla chat madre. Se la madre non è raggiungibile il riepilogo va nella sua casella (`inbox:<sessionId>`) e le viene consegnato, con un toast, appena si riapre. Se la madre fa `/clear`, figlie, casella e ruolo di hub passano al nuovo id. Se c'è un task PACA, la chat viene istruita a commentarlo e ad aggiornarne lo stato.
+- **Chiusura.** A fine del turno che ha chiamato `vertical_done` (non se interrotto), dopo 5 secondi per lasciar leggere l'ultima risposta: con `done` la finestra si chiude e la sessione si ferma (`claude stop <id>`, la cronologia resta); con `paused` si chiude solo la finestra, come Nascondi. Lo fa una shell staccata (`setsid`), così lo stop sopravvive alla sessione che lo lancia.
+- **Vecchie madri.** Una madre di prima della 1.0 non viene rinominata. Se è viva tiene le sue figlie, che nell'hub stanno sotto `madre: <nome>`. Se è spenta (assente da `claude agents --json`), l'hub adotta le sue verticali non chiuse e la sua casella.
 - **Regole nel system prompt.** A ogni composizione del prompt la mod aggiunge una sezione "Regole chat verticali": una chat un verticale; subagent per lavoro a risultato singolo, chat verticale per lavoro continuativo con decisioni dell'utente; proporre (mai imporre) un handoff quando la richiesta esce dal verticale, quando si passa a un task PACA diverso o quando il contesto supera il 60%; il brief deve bastare da solo. In una chat verticale la sezione aggiunge titolo, scope, task PACA, percorso del brief e l'obbligo di chiamare `vertical_done` a lavoro concluso.
 - **Avvisi di contesto.** A fine turno, se il contesto supera il 60%, il 75% o il 90% (una volta per soglia e per sessione) compare un toast e viene aggiunto alla conversazione un messaggio che invita a proporre un handoff invece di `/compact`.
-- **Avviso su task PACA diverso.** Se la chat cambia lo stato di un task PACA diverso da quello su cui sta lavorando (con `update_task` di qualsiasi server PACA: `paca`, `paca-homelab`, ...), il risultato del tool porta una nota che suggerisce un handoff. Il "task di riferimento" è quello della verticale o, per una chat normale, il primo task aggiornato.
+- **Avviso su task PACA diverso.** Se la chat cambia lo stato di un task PACA diverso da quello su cui sta lavorando (con `update_task` di qualsiasi server PACA: `paca`, `paca-homelab`, ...), il risultato del tool porta una nota che suggerisce un handoff.
 - **Status line.** In una chat verticale la barra di stato mostra `⟂ <slug>`.
 
 ## Comandi e tool
@@ -22,7 +27,7 @@ Nasce da un'abitudine pratica: una chat lunga e che salta tra più cose si degra
 | Cosa | Tipo | Che cosa fa |
 |---|---|---|
 | `/handoff <tema>` | comando | Fa preparare al modello (con un fork della conversazione) slug, titolo, scope e brief sul tema dato, poi avvia l'handoff come il tool. Senza tema stampa l'uso. |
-| `/verticali [tutte]` | comando | Apre il pannello Verticali e stampa l'elenco testuale delle verticali di questo progetto (con `tutte`, di ogni progetto): stato, slug, titolo, modello, data, task PACA, percorso del brief e comando di ripresa. |
+| `/verticali [tutte]` | comando | Apre l'hub, rende hub la chat (se non è una verticale e non c'è un altro hub vivo) e stampa l'elenco testuale delle verticali del progetto (con `tutte`, di ogni progetto), con il comando per riaprirle. |
 | `handoff` | tool MCP (`mcp__chat-verticali__handoff`) | Apre una nuova chat verticale. Parametri: `slug`, `title`, `scope`, `brief` (obbligatori); `paca_task_id`, `paca_ref`, `model`, `cwd` (opzionali). Va chiamato solo dopo averlo proposto all'utente. |
 | `vertical_done` | tool MCP (`mcp__chat-verticali__vertical_done`) | Chiude o mette in pausa la verticale corrente. Parametri: `summary` (obbligatorio), `status` (`done` o `paused`, default `done`). |
 
@@ -30,110 +35,99 @@ Nasce da un'abitudine pratica: una chat lunga e che salta tra più cose si degra
 
 I disegni sono ricavati dal codice di rendering (`hooks/register.tsx`, `hooks/panel.ts`), con dati inventati. I colori non si vedono in ASCII e sono annotati sotto.
 
-### Pannello "Verticali"
+### Hub
 
-Un pannello a sezioni con bordo arrotondato, mostrato solo se ci sono verticali. Si apre da solo all'avvio in una chat che ha verticali attive (come madre o come verticale) e con `/verticali`; si ridisegna quando il registro cambia (controllo ogni 4 secondi, perché il registro è scritto anche dalle altre sessioni). Qui è una chat madre, in un pannello largo 56 colonne:
+Un pannello agganciato di lato (in fullscreen da 110 colonne; chiede 72 colonne, al massimo il 45% del terminale) o sopra il prompt. Si apre da solo all'avvio in una chat che non è una verticale e che è l'hub del progetto o ha verticali aperte, e con `/verticali`. Nelle verticali non si apre da solo. Ogni 3 secondi legge `claude agents --json` e le finestre tmux marcate (`tmux list-windows -a`) e si ridisegna se qualcosa cambia.
 
 ```
-╭──────────────────────────────────────────────────────╮
-│ Attive (2)                                           │
-│ ● home-16-pannello  HOME-16 Vai                      │
-│   Pannello verticali · sonnet  ▰▰▰▱▱▱▱▱ 34%          │
-│ ● acme-backup  Vai                                   │
-│   Revisione dei backup notturni · opus  ▰▰▰▰▰▰▱▱ 72% │
-╰──────────────────────────────────────────────────────╯
-╭──────────────────────────────────────────────────────╮
-│ In pausa (1)                                         │
-│ ◐ acme-dns  HOME-9 Vai                               │
-│   Failover del DNS secondario · sonnet  ▰▰▱▱▱▱▱▱ 21% │
-╰──────────────────────────────────────────────────────╯
-╭──────────────────────────────────────────────────────╮
-│ Chiuse (ultime 5 di 7)                               │
-│ ✓ home-12-scheda  HOME-12                            │
-│   Scheda cluster nel pannello · sonnet               │
-│ ✓ acme-traefik                                       │
-│   Access log JSON · haiku                            │
-╰──────────────────────────────────────────────────────╯
+╭────────────────────────────────────────────────────────────────────╮
+│ Verticali (4)                                                      │
+│ Revisione dei backup: Apri Nascondi Stop Chiudi                    │
+│ ? Revisione dei backup notturni  ▰▰▰▰▰▰▱▱ 72% 4m  [ Nascondi ]     │
+│ └ ● Script di restore  ▰▱▱▱▱▱▱▱ 9% 1m  [ Nascondi ]                │
+│ ◆ Pannello verticali  HOME-16  ▰▰▰▱▱▱▱▱ 34% 12m  [ Nascondi ]      │
+│ ▫ Failover del DNS secondario  HOME-9  ▰▰▱▱▱▱▱▱ 21% 2h            │
+╰────────────────────────────────────────────────────────────────────╯
+╭────────────────────────────────────────────────────────────────────╮
+│ madre: portfolio-main-3                                            │
+│ ● Access log JSON  ▰▰▱▱▱▱▱▱ 18% 3m                                 │
+╰────────────────────────────────────────────────────────────────────╯
+╭────────────────────────────────────────────────────────────────────╮
+│ Chiuse (ultime 5 di 7)                                             │
+│ ✓ Scheda cluster nel pannello  HOME-12                             │
+╰────────────────────────────────────────────────────────────────────╯
 ```
 
-Nel disegno la sezione Chiuse mostra solo 2 righe per brevità; nel pannello reale sono fino a 5, dalla più recente.
+Le righe sono un albero: le verticali di primo livello in ordine di attenzione (a parità, la più recente prima), ciascuna seguita dalle sue sotto-verticali rientrate con `└`. Una riga: glifo, titolo (è un pulsante: Invio o clic = **Vai**), badge PACA, `(questa)`/`(madre)`, barra e percentuale di contesto, ultima attività (`4m`, `2h`, `5g`), pulsante **Nascondi** se la finestra è aperta.
 
-Come si legge una riga:
+Glifi, in ordine di attenzione:
 
-- Prima riga: glifo di stato, slug in grassetto, badge del task PACA (se c'è), indicazione `(questa)` o `(madre)` quando la riga è la chat corrente o la sua madre, pulsante **Vai**.
-- Seconda riga: titolo (tagliato in base alla larghezza), `·`, modello, poi la barra di contesto con la percentuale.
-- Il pulsante **Vai** manca nelle righe chiuse e nella riga della chat corrente. Salta alla finestra tmux con `tmux select-window -t <slug>`. Se la finestra non c'è più, o non si è in tmux, copia `claude --resume <sessione>` negli appunti e lo segnala con un toast.
-- La barra di contesto non c'è per le verticali chiuse, né finché la verticale non ha misurato il suo contesto.
+| Glifo | Significato | Da `claude agents --json` |
+|---|---|---|
+| `?` rosso | permesso o domanda | `waitingFor` = permission prompt / dialog |
+| `◆` giallo | input richiesto | `status` waiting, altro `waitingFor`, o `state` blocked |
+| `●` verde | al lavoro | `status` busy o `state` working |
+| `○` | aperta, ferma | viva e con la finestra aperta |
+| `▫` attenuato | nascosta | nessuna finestra (sessione viva o spenta: `attach` la riavvia) |
+| `◐` giallo | in pausa | registro `paused` |
+| `✓` attenuato | chiusa | registro `done` (ultime 5, sezione a parte) |
 
-Il pannello mostra solo le verticali del progetto della sessione: stessa repo git (le worktree contano come la repo principale) o, fuori da git, stessa cartella. Fanno eccezione le verticali legate alla sessione corrente (figlie o madre), mostrate ovunque siano. Senza verticali nel progetto il pannello dice `Nessuna chat verticale in questo progetto.`
+Barra di contesto `▰▱`: verde sotto 60%, gialla da 60%, rossa da 80%. Il badge PACA è inverse.
 
-Colori e glifi:
+**Tasti** (con il pannello a fuoco: ctrl+x tab o clic). Tab e frecce scelgono la riga; i tasti agiscono sulla riga a fuoco, altrimenti sulla prima:
 
-| Elemento | Resa |
+| Tasto | Azione |
 |---|---|
-| `●` | verticale attiva, verde |
-| `◐` | in pausa, giallo |
-| `✓` | chiusa, attenuata (anche slug e titolo) |
-| Bordo e titolo di Attive / In pausa | verde / giallo; Chiuse e pannello vuoto in grigio |
-| Badge del task (` HOME-16 `) | inverse, colore del terminale |
-| `(questa)` e `(madre)` | attenuati |
-| Barra di contesto `▰▱` | verde sotto 60%, gialla da 60%, rossa da 80% |
-| Titolo, modello | attenuati |
+| Invio sulla riga, `a` | **Vai/Apri**: seleziona la finestra con `@cv_id`; se non c'è la apre con `claude attach <id>` (una verticale in pausa torna attiva). Fuori da tmux copia il comando negli appunti. |
+| `h` | **Nascondi**: `tmux kill-window`, la sessione resta viva. Nessuna conferma. |
+| `s` | **Stop**: chiude la finestra e fa `claude stop <id>`, con conferma. La cronologia resta. |
+| `x` | **Chiudi**: con conferma, chiede alla verticale di chiamare `vertical_done` (che poi la ferma). Se non è raggiungibile la segna chiusa senza riepilogo e la ferma. |
 
-Il contesto mostrato è quello che ogni verticale scrive sul proprio record (a ogni misura del contesto). Per le righe in sezione "Chiuse" il titolo dice `Chiuse (N)` se sono tutte visibili, `Chiuse (ultime 5 di N)` altrimenti.
+**Pannello stretto.** Sotto 60 colonne di corpo il pannello passa al layout compatto: glifo, titolo tagliato e barra corta con percentuale, senza badge PACA né ultima attività; la riga dei tasti mostra solo i tasti.
+
+**Verticali v0.3** (interattive, senza `agentId`): restano visibili e raggiungibili con **Vai** (`tmux select-window -t <slug>`, ripiego su `claude --resume` copiato), ma non si possono nascondere né fermare dall'hub.
 
 ### Barra di stato e finestre tmux
 
-In una chat verticale la status line mostra lo slug:
+In una chat verticale la status line mostra `⟂ <slug>`. Le finestre tmux, con l'hub in finestra 0:
 
 ```
-⟂ home-16-pannello
+ 0:hub  1:HOME-16: Pannello verticali  2:Revisione dei backup
 ```
 
-Con tmux, la finestra della verticale si chiama come lo slug, per esempio:
-
-```
- 0:Mod UI multi-agent  1:home-16-pannello  2:acme-backup
-```
-
-(Se è installata anche la mod `multi-view`, questa non rinomina le finestre con un nome scelto a mano: lo slug resta.)
+La sessione tmux per progetto la apre l'utente: la mod non crea sessioni tmux e non tocca le opzioni globali.
 
 ## Flusso: madre, verticale, ritorno
 
 ```
-  CHAT MADRE                                   CHAT VERTICALE
-  ----------                                   --------------
+  HUB (chat madre, finestra 0)                 CHAT VERTICALE (claude --bg)
+  ----------------------------                 ----------------------------
   il lavoro esce dal verticale,
   oppure contesto > 60%
         |
         v
-  Claude PROPONE l'handoff
-        |  l'utente accetta
-        v
-  tool handoff (brief, scope, modello)
+  Claude PROPONE l'handoff, l'utente accetta
         |
-        |-- chiede conferma ("Apro una nuova chat?")
+  tool handoff
+        |-- chiede conferma
         |-- scrive ~/.claude/handoffs/<slug>.md
-        |-- registra v:<sessione> = active
-        |-- tmux new-window -n <slug>  ------------>  claude --session-id ...
+        |-- claude --bg -n "<REF>: <Titolo>"  ---->  parte in background,
+        |-- legge l'id da claude agents --json        legge il brief,
+        |-- registra v:<sessione> = active            conferma in 3 righe
+        |-- tmux new-window claude attach <id>
+        |   + @cv_id; madre -> hub                    lavora nello scope
         |                                                    |
-        |                                              legge il brief,
-        |                                              conferma in 3 righe
-        |                                                    |
-        |                                              lavora nello scope
-        |                                              (utente decide)
-        |                                                    |
+        |   (h nasconde la finestra, a la riapre:            |
+        |    la sessione resta viva)                         |
         |                                              tool vertical_done
-        |                                              (summary, done|paused)
-        |                                                    |
-        |   riepilogo via $.session.send               scrive "## Esito"
-        |<---------------------------------------------- nel brief, registro
-        v                                              aggiornato
-  la madre riceve "[chat verticale ... done]"
-  e il PACA del task viene commentato
+        |   riepilogo via $.session.send               scrive "## Esito",
+        |<---------------------------------------------- registro aggiornato
+        v                                                    |
+  la madre riceve "[chat verticale ... done]"          a fine turno:
+  e il PACA del task viene commentato                  kill-window + claude stop
 ```
 
-Il riepilogo arriva alla madre come messaggio di un'altra sessione (se la madre è chiusa, resta nel brief). Il commento sul task PACA lo fa il modello, non la mod: la mod gli ricorda di farlo nel risultato del tool.
+Il commento sul task PACA lo fa il modello, non la mod: la mod gli ricorda di farlo nel risultato del tool.
 
 ## Installazione
 
@@ -154,7 +148,7 @@ claude plugin install chat-verticali@gorlix-chat-verticali
 
 Poi, nella sessione già aperta, `/reload-plugins`. Il plugin è letto dalla cartella: dopo ogni modifica al codice basta di nuovo `/reload-plugins`, ma alza la versione in `plugin.json` a ogni rilascio, altrimenti resta in uso la copia in cache.
 
-Requisiti: `tmux` (consigliato; senza si ripiega su `claude --bg`) e `claude` nel PATH. PACA è facoltativo: senza, `paca_task_id` e `paca_ref` restano vuoti.
+Requisiti: Claude Code 2.1.318 o successivo (`claude --bg`, `claude agents --json`, `claude attach`, `claude stop`), `claude` e `setsid` nel PATH, `tmux` consigliato (senza, le verticali partono comunque in background e si aprono con `claude attach <id>`). PACA è facoltativo: senza, `paca_task_id` e `paca_ref` restano vuoti.
 
 ## Sviluppo
 
@@ -165,8 +159,8 @@ claude-chat-verticali/
 │   └── marketplace.json   # marketplace gorlix-chat-verticali, sorgente ./
 ├── hooks/
 │   ├── hooks.json         # dichiara il modulo: ./register.tsx
-│   ├── register.tsx       # tool, comandi, regole nel prompt, pannello, soglie
-│   └── panel.ts           # helper grafici puri: barra, glifi, raggruppamento
+│   ├── register.tsx       # tool, comandi, avvio in background, hub, tasti, chiusura, soglie
+│   └── panel.ts           # helper puri: nomi, attenzione, glifi, albero, barra
 ├── types/index.d.ts       # tipi condivisi
 ├── tests/register.test.ts
 └── tsconfig.json
@@ -184,9 +178,10 @@ Il type-check si fa con `tsc -p .`. Le funzioni che ricevono `$` stanno a livell
 ## Limiti noti
 
 - **Registro senza atomicità.** Il registro è uno store JSON del plugin (una chiave per verticale), condiviso tra tutte le sessioni; non c'è una transazione tra processi. Due sessioni che scrivono lo stesso record insieme possono sovrascriversi: in pratica ogni record lo scrive quasi solo la sua verticale, ma non è garantito.
-- **Contesto delle altre chat.** Ogni verticale scrive la propria percentuale di contesto solo quando cambia; il pannello della madre mostra quindi l'ultimo valore noto, aggiornato al giro di controllo successivo (4 secondi), non una lettura in tempo reale. La madre non mostra il proprio contesto nel pannello, perché non ha un record: lo mostra la banda di `multi-view`, se installata.
-- **`select-window` per prefisso.** Il pulsante **Vai** usa `tmux select-window -t <slug>`, e tmux risolve il nome anche per prefisso: slug che iniziano allo stesso modo (`home-1` e `home-16`) possono portare alla finestra sbagliata se quella esatta è sparita. Se nessuna finestra corrisponde, ripiega sul comando di ripresa copiato.
+- **Registro dopo l'avvio.** `claude --bg` sceglie il session id, quindi il record nasce un attimo dopo l'avvio: il primo turno della verticale può non avere ancora la sezione di scope nel system prompt (il prompt iniziale le fa comunque leggere il brief) e la status line `⟂ slug` compare al primo giro di controllo.
+- **Sessioni spente.** Una sessione in background ferma e non collegata da circa un'ora viene spenta da Claude Code: nell'hub appare come nascosta (`▫`) e riparte al successivo **Vai**. Non è verificato se un messaggio (riuso, Chiudi) la risvegli: se non arriva, il riuso aggiunge l'aggiornamento al brief e Chiudi la segna chiusa senza riepilogo.
+- **Costo del controllo.** L'hub esegue `claude agents --json` e `tmux list-windows` ogni 3 secondi finché ha verticali aperte.
+- **Socket tmux.** La chiusura a `done` parte dalla sessione in background, che non eredita `$TMUX`: usa il socket tmux di default.
+- **Contesto delle altre chat.** Ogni verticale scrive la propria percentuale di contesto solo quando cambia; l'hub mostra l'ultimo valore noto. La madre non mostra il proprio contesto, perché non ha un record.
 - **Il brief è fatto dal modello.** La qualità del passaggio dipende da quanto bene la chat madre riassume. `/handoff` chiede il JSON a un fork della conversazione e può fallire con un JSON non valido: in quel caso lo dice e conviene chiederlo a parole.
-- **Il ritorno è best effort.** Se la madre è chiusa o non raggiungibile, il riepilogo resta solo nel brief; nessuna notifica successiva. Anche il commento su PACA dipende dal fatto che il modello esegua l'istruzione.
-- **Fuori da tmux.** La modalità `--bg` è un ripiego: niente finestra da raggiungere con **Vai**, solo il comando `claude attach`.
-- **Nessun pannello senza verticali.** Con zero verticali registrate il pannello si apre solo con `/verticali`.
+- **Il ritorno è best effort.** Anche il commento su PACA dipende dal fatto che il modello esegua l'istruzione.
