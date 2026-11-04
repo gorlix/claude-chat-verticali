@@ -1241,12 +1241,13 @@ export const register: Register = on => {
   on('command.run', { command: 'handoff' }, async ($, e) => {
     const topic = e.args.trim()
     if (!topic) return { text: 'Uso: /handoff <tema o task da passare a una nuova chat>' }
-    const forked = await $.model.fork({
-      prompt:
-        `Prepara il passaggio di contesto a una nuova chat verticale sul tema: "${topic}". ` +
-        'Rispondi SOLO con JSON valido, senza testo attorno: ' +
-        '{"slug":"...","title":"titolo breve","scope":"...","brief":"markdown 1-2k token: obiettivo e criterio di fatto, decisioni prese, stato, file/branch/worktree, ID PACA, domande aperte, regole del repo, cosa NON fare","paca_task_id":"uuid o vuoto","paca_ref":"es. ACME-42 o vuoto","model":"sonnet|opus|haiku"}',
-    })
+    const prompt =
+      `Prepara il passaggio di contesto a una nuova chat verticale sul tema: "${topic}". ` +
+      'Rispondi SOLO con JSON valido, senza testo attorno: ' +
+      '{"slug":"...","title":"titolo breve","scope":"...","brief":"markdown 1-2k token: obiettivo e criterio di fatto, decisioni prese, stato, file/branch/worktree, ID PACA, domande aperte, regole del repo, cosa NON fare","paca_task_id":"uuid o vuoto","paca_ref":"es. ACME-42 o vuoto","model":"sonnet|opus|haiku"}'
+    let forked = await $.model.fork({ prompt })
+    // A new session has no conversation to fork: the topic is the only context.
+    if (!forked.isAnswered && forked.reason === 'nothing-to-fork') forked = await $.model.complete({ model: 'sonnet', prompt })
     if (!forked.isAnswered) return { text: `Non riesco a preparare il brief (${forked.reason}). Chiedilo a Claude a parole.` }
     const json = forked.text.slice(forked.text.indexOf('{'), forked.text.lastIndexOf('}') + 1)
     let input: HandoffInput

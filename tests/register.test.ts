@@ -851,3 +851,16 @@ test('a zellij vertical, done: its tab closes by id from a detached shell, then 
   await $.turn.complete(turnEnd())
   expect(runs.find(r => r[0] === 'setsid')).toEqual(['setsid', '-f', 'sh', '-c', "exec >/dev/null 2>&1; sleep 5; zellij --session 'zs' action close-tab-by-id 5; claude stop 'aa'"])
 })
+
+test('/handoff in a new session (nothing to fork) asks a plain completion with the topic', async ($, on) => {
+  const asked: string[] = []
+  on('model.fork', () => ({ value: { isAnswered: false, reason: 'nothing-to-fork' } }))
+  on('model.complete', (_$, e) => {
+    asked.push((e as { prompt: string }).prompt)
+    return { value: { isAnswered: true, text: 'non json', usage: {} } }
+  })
+  const ran = await $.command.run({ command: 'handoff', args: 'tema x' })
+  expect(asked).toHaveLength(1)
+  expect(asked[0]).toContain('"tema x"')
+  expect(ran.text).toContain('non era JSON valido')
+})
