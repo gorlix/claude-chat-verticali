@@ -260,7 +260,7 @@ const turnEnd = (reason = 'answer') =>
 
 // A vertical with its brief on a fake fs, its mother as `mother`; `delivered` is what the send answers.
 const doneSetup = (on: Parameters<typeof mock.store>[0], opts: { delivered: boolean; pane?: string; start?: string }) => {
-  const data = spyStore(on, { 'v:a': v('a', { parentSessionId: 'mother', briefPath: '/tmp/a.md' }) })
+  const data = spyStore(on, { 'v:a': v('a', { parentSessionId: 'mother', briefPath: '/tmp/a.md', cleanupStatus: 'approved', cleanupPlan: [] }) })
   const runs: string[][] = []
   const toasts: string[] = []
   on('session.id', () => ({ value: 'a' }))
@@ -275,7 +275,8 @@ const doneSetup = (on: Parameters<typeof mock.store>[0], opts: { delivered: bool
   on('session.send', () => (opts.delivered ? { isDelivered: true } : { isDelivered: false, reason: 'gone' }))
   on('ui.toast', ($, e) => ({ value: void toasts.push((e as { text: string }).text) }))
   here(on, '/tmp', argv => {
-    runs.push(argv)
+    // The cleanup inventory reads sessions and windows: not what these tests watch.
+    if (!['agents', 'list-windows'].includes(argv[1])) runs.push(argv)
     return argv[1] === 'display-message' ? { ...runOk, stdout: opts.start ?? '' } : runOk
   })
   return { data, runs, toasts }
@@ -455,7 +456,7 @@ test('hub keys: Vai selects or opens by id, Nascondi kills the window, Stop and 
 })
 
 const bgDone = (on: Parameters<typeof mock.store>[0]) => {
-  const data = spyStore(on, { 'v:a': v('a', { agentId: 'aa', parentSessionId: 'mother', briefPath: '/tmp/a.md' }) })
+  const data = spyStore(on, { 'v:a': v('a', { agentId: 'aa', parentSessionId: 'mother', briefPath: '/tmp/a.md', cleanupStatus: 'approved', cleanupPlan: [] }) })
   const runs: string[][] = []
   on('session.id', () => ({ value: 'a' }))
   on('session.usage', () => ({ value: { context: {} } }))
@@ -512,4 +513,123 @@ test('the hub adopts the open children and the inbox of a mother that is gone', 
   // x is a vertical, stopped or not: its child stays with it.
   expect((data.get('v:s') as { parentSessionId: string }).parentSessionId).toBe('x')
   expect(data.get('inbox:main')).toEqual(['esito'])
+})
+
+// --- Cleanup gate before done ---
+
+// A vertical in /repo on main; `git` answers from `repo`, which a test changes.
+const gateSetup = (on: Parameters<typeof mock.store>[0], over: object = {}) => {
+  const data = spyStore(on, {
+    'v:a': v('a', {
+      cwd: '/repo', project: '/repo', parentSessionId: 'mother', briefPath: '/tmp/a.md',
+      startBranch: 'main', startBranches: ['main', 'old'], startWorktrees: [], startedAt: 1_000, ...over,
+    }),
+  })
+  const repo = { branches: ['main', 'old'], dirty: [] as string[], head: 'main' }
+  const toasts: string[] = []
+  on('session.id', () => ({ value: 'a' }))
+  on('session.usage', () => ({ value: { context: {} } }))
+  on('clock.now', () => ({ value: 1_760_000_000_000 }))
+  on('fs.read', () => ({ value: '# brief\n' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('env.get', () => ({ value: undefined }))
+  on('session.send', () => ({ isDelivered: true }))
+  on('ui.toast', (_$, e) => ({ value: void toasts.push((e as { text: string }).text) }))
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('process.run', (_$, e) => {
+    const argv = [...(e as { argv: string[] }).argv]
+    const out = (stdout: string) => ({ value: { ...runOk, stdout } })
+    if (argv[0] !== 'git') return out('')
+    if (argv[1] === 'rev-parse') return out('/repo/.git\n')
+    if (argv[1] === 'status') return out(repo.dirty.map(f => ` M ${f}`).join('\n'))
+    if (argv[1] === 'branch') return out(`${repo.head}\n`)
+    if (argv[1] === 'for-each-ref') return out(repo.branches.join('\n'))
+    return out('')
+  })
+  return { data, repo, toasts }
+}
+
+test('the gate: the first done does not close and lists what is mine apart from what is not', async ($, on) => {
+  const { data, repo } = gateSetup(on, { created: { branches: ['feat/x'] } })
+  repo.branches.push('feat/x', 'feat/altrui')
+  const ran = await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)
+  const text = String(ran.result)
+  expect(text).toContain('NON è chiusa')
+  expect(text.split('Non attribuibili')[0]).toContain('git-ramo:feat/x')
+  expect(text.split('Non attribuibili')[1]).toContain('git-ramo:feat/altrui')
+  expect((data.get('v:a') as { status: string }).status).toBe('active')
+  expect(data.has('close:a')).toBe(false)
+})
+
+test('the gate: a plan must cover my items and leave others alone; a full one waits for the mother', async ($, on) => {
+  const { data, repo } = gateSetup(on, { created: { branches: ['feat/x'] } })
+  repo.branches.push('feat/x', 'feat/altrui')
+  const call = (plan: object[]) => $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok', cleanup_plan: plan } as never)
+  expect(String((await call([{ item: 'altro', action: 'keep', reason: 'r' }])).result)).toContain('Mancano')
+  const greedy = await call([
+    { item: 'git-ramo:feat/x', action: 'remove', reason: 'mergiato' },
+    { item: 'git-ramo:feat/altrui', action: 'remove', reason: 'boh' },
+  ])
+  expect(String(greedy.result)).toContain('non attribuibili')
+  const ok = await call([{ item: 'git-ramo:feat/x', action: 'remove', reason: 'mergiato' }])
+  expect(String(ok.result)).toContain('approvazione')
+  expect(data.get('v:a')).toMatchObject({ cleanupStatus: 'pending', status: 'active' })
+  const again = await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)
+  expect(String(again.result)).toContain('in attesa')
+})
+
+test('the gate: after approval, a leftover of mine refuses the close; a clean repo closes', async ($, on) => {
+  const plan = [{ item: 'git-ramo:feat/x', action: 'remove', reason: 'mergiato' }]
+  const { data, repo } = gateSetup(on, { created: { branches: ['feat/x'] }, cleanupStatus: 'approved', cleanupPlan: plan })
+  repo.branches.push('feat/x')
+  const dirty = await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok', cleanup_report: 'fatto' } as never)
+  expect(String(dirty.result)).toContain('Chiusura rifiutata')
+  expect(String(dirty.result)).toContain('git-ramo:feat/x')
+  repo.branches.pop()
+  // Another chat's branch is not this vertical's business: it does not block.
+  repo.branches.push('feat/altrui')
+  const clean = await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok', cleanup_report: 'ramo rimosso' } as never)
+  expect(String(clean.result)).toContain('segnata done')
+  expect((data.get('v:a') as { status: string }).status).toBe('done')
+})
+
+test('Bash calls of a vertical record the branches they create and the sessions they start', async ($, on) => {
+  const { data, repo } = gateSetup(on)
+  on('tool.call', { tool: 'Bash' }, () => {
+    repo.branches.push('feat/nuovo')
+    return { result: 'backgrounded · ab12cd34 · prova' }
+  })
+  await $.tool.call({ tool: 'Bash', command: 'git switch -c feat/nuovo && claude --bg prova' } as never)
+  expect((data.get('v:a') as { created: object }).created).toMatchObject({ branches: ['feat/nuovo'], sessions: ['ab12cd34'] })
+})
+
+test('the hub asks the person to approve a child\'s pending plan, once, and writes the answer', async ($, on) => {
+  const data = spyStore(on, {
+    'hub:/tmp': 'main',
+    'v:x': v('x', { agentId: 'xx', parentSessionId: 'main', cleanupStatus: 'pending', cleanupPlan: [{ item: 'git-ramo:f', action: 'remove', reason: 'r' }] }),
+  })
+  const sent: string[] = []
+  const questions: string[] = []
+  const clock = mock.clock(on, { now: 1_760_000_000_000 })
+  on('session.id', () => ({ value: 'main' }))
+  on('env.get', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('tool.register', () => ({ value: undefined }))
+  on('session.start', (_$, e) => e as never)
+  on('command.register', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.send', (_$, e) => ({ isDelivered: Boolean(sent.push(JSON.stringify(e))) }))
+  on('tool.call', { tool: 'AskUserQuestion' }, (_$, e) => {
+    const q = (e as unknown as { questions: { question: string }[] }).questions[0].question
+    questions.push(q)
+    return { result: { answers: { [q]: 'Approva' } } }
+  })
+  here(on, '/tmp', hubRun([{ sessionId: 'x', id: 'xx' }], {}))
+  await $.session.start({ source: 'startup', cwd: '/tmp', surface: null, isInteractive: true } as never)
+  await clock.advance(3000)
+  await clock.advance(3000)
+  expect(questions).toHaveLength(1)
+  expect(questions[0]).toContain('RIMUOVI git-ramo:f')
+  expect(data.get('v:x')).toMatchObject({ cleanupStatus: 'approved' })
+  expect(sent[0]).toContain('approvato')
 })

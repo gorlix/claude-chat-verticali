@@ -41,6 +41,28 @@ type Vertical = {
   contextPercent?: number
   contextAt?: string
   lastAt?: string
+  // Snapshot at launch, so the cleanup inventory lists only what the vertical left.
+  startBranch?: string
+  startBranches?: string[]
+  startWorktrees?: string[]
+  startedAt?: number
+  // Cleanup gate before `done`: the plan waits for the mother's approval.
+  cleanupStatus?: 'pending' | 'approved'
+  cleanupPlan?: PlanItem[]
+  cleanupNote?: string
+  // What this vertical made, seen by its own tool calls: only these are its to clean.
+  created?: Created
+}
+
+type Created = { branches?: string[]; worktrees?: string[]; stashes?: string[]; sessions?: string[]; files?: string[]; head?: boolean }
+
+type PlanItem = { item: string; action: 'keep' | 'remove'; reason: string }
+
+type DoneInput = {
+  summary: string
+  status?: 'done' | 'paused'
+  cleanup_plan?: PlanItem[]
+  cleanup_report?: string
 }
 
 type HandoffInput = {
@@ -302,6 +324,7 @@ async function startHandoff($: EngineInterface, input: HandoffInput): Promise<st
     createdAt: await today($),
   }
   v.project = await projectOf($, v.cwd)
+  Object.assign(v, await baseline($, v.project))
   const from = parent ? `verticale ${parent.slug}` : `sessione ${parentId}`
   // The brief exists before the launch: the new chat reads it on its first turn.
   await $.fs.write(v.briefPath, briefText(v, input.brief, from))
@@ -363,20 +386,212 @@ async function adoptOrphans($: EngineInterface, live: Live[]) {
   if (gone.size) await bump($)
 }
 
+// --- Cleanup gate ---
+
+const runOut = async ($: EngineInterface, argv: string[], cwd: string) => {
+  const ran = await $.process.run(argv, { cwd, timeoutMs: 15_000 }).catch(() => undefined)
+  return ran?.exitCode === 0 ? ran.stdout : ''
+}
+const lines = (text: string) => text.split('\n').map(l => l.trimEnd()).filter(Boolean)
+const branchesOf = async ($: EngineInterface, repo: string) =>
+  lines(await runOut($, ['git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads'], repo))
+const worktreesOf = async ($: EngineInterface, repo: string) =>
+  lines(await runOut($, ['git', 'worktree', 'list', '--porcelain'], repo))
+    .filter(l => l.startsWith('worktree '))
+    .map(l => l.slice(9))
+    .filter(path => path !== repo)
+
+// What the repo looks like when the vertical starts.
+async function baseline($: EngineInterface, repo: string) {
+  return {
+    startBranch: (await runOut($, ['git', 'branch', '--show-current'], repo)).trim() || undefined,
+    startBranches: await branchesOf($, repo),
+    startWorktrees: await worktreesOf($, repo),
+    startedAt: Date.now(),
+  }
+}
+
+// The repo as a Bash call may change it: branches, worktrees, stashes, the
+// main checkout's branch, the files left modified.
+async function repoState($: EngineInterface, v: Vertical) {
+  const repo = v.project ?? (await projectOf($, v.cwd))
+  const dirty: string[] = []
+  for (const dir of new Set([v.cwd, repo])) {
+    for (const l of lines(await runOut($, ['git', 'status', '--porcelain'], dir))) dirty.push(`${dir}/${l.slice(3)}`)
+  }
+  return {
+    repo,
+    dirty,
+    head: (await runOut($, ['git', 'branch', '--show-current'], repo)).trim(),
+    branches: await branchesOf($, repo),
+    worktrees: await worktreesOf($, repo),
+    stashes: lines(await runOut($, ['git', 'stash', 'list', '--format=%gd %H %ct %s'], repo)),
+  }
+}
+type RepoState = Awaited<ReturnType<typeof repoState>>
+
+// Adds to the record what appeared between two states, plus sessions the call started.
+async function noteCreated($: EngineInterface, v: Vertical, before: RepoState, after: RepoState, output: string) {
+  const fresh = (await thisVertical($)) ?? v
+  const c: Created = { ...fresh.created }
+  const add = (key: 'branches' | 'worktrees' | 'stashes' | 'sessions' | 'files', items: string[]) => {
+    if (items.length) c[key] = [...new Set([...(c[key] ?? []), ...items])]
+  }
+  const fresh_ = (a: string[], b: string[]) => a.filter(x => !b.includes(x))
+  add('branches', fresh_(after.branches, before.branches))
+  add('worktrees', fresh_(after.worktrees, before.worktrees))
+  add('stashes', fresh_(after.stashes.map(l => l.split(' ')[1]), before.stashes.map(l => l.split(' ')[1])))
+  add('files', fresh_(after.dirty, before.dirty))
+  add('sessions', [...output.matchAll(/backgrounded\s+·\s+([\w-]+)/g)].map(m => m[1]))
+  if (after.head !== before.head) c.head = after.head !== (fresh.startBranch ?? after.head)
+  if (JSON.stringify(c) !== JSON.stringify(fresh.created ?? {})) await $.store.set(verticalKey(v.sessionId), { ...fresh, created: c })
+}
+
+// What lies around at `done`, one stable line per item. `mine`: made by this
+// vertical (its record says so), to keep or remove in the plan. `others`: not
+// attributable, reported as "non mio, non toccato" and never cleaned.
+async function inventory($: EngineInterface, v: Vertical): Promise<{ mine: string[]; others: string[] }> {
+  const now = await repoState($, v)
+  const c = v.created ?? {}
+  const mine: string[] = []
+  const others: string[] = []
+  const put = (isMine: boolean | undefined, item: string) => (isMine ? mine : others).push(item)
+  for (const f of now.dirty) put(c.files?.includes(f), `git-modifica:${f}`)
+  const start = v.startBranch ?? 'main'
+  if (now.head && now.head !== start) put(c.head, `git-repo-principale-su:${now.head} (partenza ${start})`)
+  const knownWt = new Set(v.startWorktrees ?? [])
+  for (const wt of now.worktrees) if (!knownWt.has(wt)) put(c.worktrees?.includes(wt), `git-worktree:${wt}`)
+  const knownBr = new Set(v.startBranches ?? [start])
+  for (const b of now.branches) if (!knownBr.has(b)) put(c.branches?.includes(b), `git-ramo:${b}`)
+  const since = v.startedAt ?? Date.parse(v.createdAt)
+  for (const l of now.stashes) {
+    const [ref, hash, at, ...msg] = l.split(' ')
+    if (c.stashes?.includes(hash) || Number(at) * 1000 >= since) put(c.stashes?.includes(hash), `git-stash:${ref} ${msg.join(' ')}`)
+  }
+  const all = await allVerticals($)
+  const registered = new Set(all.map(r => r.sessionId))
+  for (const a of await listAgents($)) {
+    if (a.sessionId === v.sessionId || registered.has(a.sessionId) || !a.cwd) continue
+    const isMine = Boolean(a.id && c.sessions?.includes(a.id))
+    if (isMine || ((a.startedAt ?? 0) > since && (await projectOf($, a.cwd)) === now.repo)) {
+      put(isMine, `sessione:${a.id ?? a.sessionId} ${a.name ?? ''}`.trim())
+    }
+  }
+  const windows = await taggedWindows($)
+  for (const ch of all.filter(ch => ch.parentSessionId === v.sessionId && ch.status !== 'done')) {
+    mine.push(`figlia:${ch.slug}`)
+    if (windows[ch.sessionId]) mine.push(`finestra-tmux:${windows[ch.sessionId]} (${ch.slug})`)
+  }
+  return { mine, others }
+}
+
+const bullet = (items: string[]) => items.map(i => `- ${i}`).join('\n') || '- (niente)'
+const planText = (plan: PlanItem[]) =>
+  plan.map(p => `- ${p.action === 'keep' ? 'TIENI' : 'RIMUOVI'} ${p.item}: ${p.reason}`).join('\n')
+
+// `done` passes only through the gate: inventory, plan, the mother's approval,
+// cleanup, a clean second inventory. Returns why it stops, or undefined to close.
+async function cleanupGate($: EngineInterface, v: Vertical, input: DoneInput): Promise<string | undefined> {
+  const { mine: items, others } = await inventory($, v)
+  const save = (patch: Partial<Vertical>) => $.store.set(verticalKey(v.sessionId), { ...v, ...patch })
+
+  if (v.cleanupStatus === 'approved' && !input.cleanup_plan) {
+    const keep = new Set((v.cleanupPlan ?? []).filter(p => p.action === 'keep').map(p => p.item))
+    const left = items.filter(i => !keep.has(i))
+    if (left.length === 0) return undefined
+    return (
+      'Chiusura rifiutata: dopo la pulizia restano voci che il piano approvato non tiene:\n' + bullet(left) +
+      '\nRimuovile e richiama vertical_done (status done, cleanup_report), oppure manda un nuovo cleanup_plan da approvare.'
+    )
+  }
+  if (v.cleanupStatus === 'pending' && !input.cleanup_plan) {
+    return 'Piano di pulizia in attesa di approvazione dalla chat madre: aspetta la risposta, non chiudere e non pulire ancora.'
+  }
+  if (!input.cleanup_plan) {
+    return [
+      'Prima di chiudere serve la pulizia (gate obbligatorio). La verticale NON è chiusa.',
+      '',
+      'Inventario raccolto dalla mod, voci create da questa verticale:',
+      bullet(items),
+      '',
+      'Non attribuibili a questa verticale (non mio, non toccato: NON vanno nel piano e non si toccano):',
+      bullet(others),
+      '',
+      'Checklist:',
+      '- ogni voce tua: tenere o rimuovere, con il motivo (riporta il testo della voce identico)',
+      '- file temporanei (scratchpad, /tmp, prove) e processi che hai avviato tu: aggiungili come voci tue',
+      '- la pulizia non si traccia su PACA',
+      '',
+      'Richiama vertical_done con status done, lo stesso summary e `cleanup_plan`: [{item, action: "keep"|"remove", reason}]. ' +
+      'La madre lo approva; poi esegui la pulizia e richiama vertical_done (status done) con `cleanup_report`.',
+    ].join('\n')
+  }
+  const named = new Set(input.cleanup_plan.map(p => p.item))
+  const missing = items.filter(i => !named.has(i))
+  if (missing.length) return `Il piano non copre tutte le voci dell'inventario. Mancano:\n${bullet(missing)}\nRimanda cleanup_plan completo.`
+  const notMine = input.cleanup_plan.filter(p => p.action === 'remove' && others.includes(p.item)).map(p => p.item)
+  if (notMine.length) return `Il piano rimuove voci non attribuibili a questa verticale (non tue, non si toccano):\n${bullet(notMine)}\nToglile dal piano e rimandalo.`
+  await save({ cleanupStatus: 'pending', cleanupPlan: input.cleanup_plan, cleanupNote: undefined })
+  if (!v.parentSessionId) {
+    const answer = await askCleanup($, { ...v, cleanupPlan: input.cleanup_plan })
+    return answer === 'Approva'
+      ? 'Piano approvato: esegui la pulizia, poi richiama vertical_done (status done) con cleanup_report.'
+      : `Piano non approvato${answer === 'Rifiuta' ? '' : `: ${answer}`}. Correggilo e rimanda cleanup_plan.`
+  }
+  await bump($)
+  return 'Piano di pulizia inviato alla chat madre per l\'approvazione. Aspetta la risposta (arriva come messaggio): non chiudere e non pulire ancora.'
+}
+
+// Asks the person to approve a vertical's cleanup plan; writes the answer on
+// its record. Anything typed under "Other" is a change the vertical must make.
+async function askCleanup($: EngineInterface, v: Vertical): Promise<string> {
+  const answer = await $.ui.ask(
+    `La verticale «${v.title}» vuole chiudersi. Piano di pulizia:\n${planText(v.cleanupPlan ?? [])}\nApprovi? (in "Other" scrivi le modifiche da chiedere)`,
+    { header: 'Pulizia', options: ['Approva', 'Rifiuta'] },
+  )
+  const fresh = ((await $.store.get(verticalKey(v.sessionId))) as Vertical | undefined) ?? v
+  const approved = answer === 'Approva'
+  await $.store.set(verticalKey(v.sessionId), {
+    ...fresh,
+    cleanupStatus: approved ? 'approved' : undefined,
+    cleanupNote: approved ? undefined : answer,
+  })
+  await bump($)
+  return answer
+}
+
+// The mother (or the hub that adopted the vertical) answers a pending plan.
+async function answerCleanup($: EngineInterface, v: Vertical) {
+  const answer = await askCleanup($, v)
+  const text = answer === 'Approva'
+    ? '[chat-verticali] Piano di pulizia approvato dall\'utente: eseguilo ora, poi chiama vertical_done (status done) con cleanup_report.'
+    : `[chat-verticali] Piano di pulizia ${answer === 'Rifiuta' ? 'rifiutato' : `da modificare: ${answer}`}. Correggilo e richiama vertical_done con un nuovo cleanup_plan.`
+  await $.session.send({ to: { sessionId: v.sessionId }, text })
+}
+
 async function finishVertical(
   $: EngineInterface,
-  input: { summary: string; status?: 'done' | 'paused' },
+  input: DoneInput,
 ): Promise<string> {
   const v = await thisVertical($)
   if (!v) return 'Questa chat non è una chat verticale: niente da chiudere.'
   const status = input.status ?? 'done'
+  let summary = input.summary.trim()
+  if (status === 'done') {
+    const stop = await cleanupGate($, v, input)
+    if (stop) return stop
+    if (input.cleanup_report) summary += `\n\nPulizia:\n${input.cleanup_report.trim()}`
+  } else {
+    const { mine, others } = await inventory($, v)
+    summary += `\n\nLasciato in giro da questa verticale:\n${bullet(mine)}\n\nNon mio, non toccato:\n${bullet(others)}`
+  }
   await $.fs.write(v.briefPath,
-    `${await $.fs.read(v.briefPath)}\n## Esito (${status}, ${await today($)})\n\n${input.summary.trim()}\n`)
-  await $.store.set(verticalKey(v.sessionId), { ...v, status })
+    `${await $.fs.read(v.briefPath)}\n## Esito (${status}, ${await today($)})\n\n${summary}\n`)
+  await $.store.set(verticalKey(v.sessionId), { ...((await thisVertical($)) ?? v), status })
 
   let parentNote = 'nessuna chat madre registrata'
   if (v.parentSessionId) {
-    const text = `[chat verticale «${v.slug}» — ${status}]\n\n${input.summary.trim()}\n\nBrief completo: ${v.briefPath}`
+    const text = `[chat verticale «${v.slug}» — ${status}]\n\n${summary}\n\nBrief completo: ${v.briefPath}`
     const sent = await $.session.send({ to: { sessionId: v.parentSessionId }, text })
     if (sent.isDelivered) parentNote = 'riepilogo inviato alla chat madre'
     else {
@@ -557,7 +772,8 @@ function rulesSection(v: Vertical | undefined): string {
     v.pacaTaskId ? `Task PACA: ${v.pacaRef ?? ''} \`${v.pacaTaskId}\`` : '',
     `Brief: ${v.briefPath}`,
     '- Resta nello scope. Se l\'utente chiede altro, rispondi brevemente solo se banale, altrimenti proponi un handoff verso un\'altra chat verticale.',
-    '- A lavoro concluso (o se va messo in pausa) chiama `mcp__chat-verticali__vertical_done` con un riepilogo: cosa è stato fatto, file/commit, deploy sì/no, cosa resta aperto. Poi commenta il task PACA.',
+    '- A lavoro concluso (o se va messo in pausa) chiama `mcp__chat-verticali__vertical_done` con un riepilogo: cosa è stato fatto, file/commit, deploy sì/no, cosa resta aperto.',
+    '- Gate di pulizia (obbligatorio, lo impone la mod): lavora in una worktree o in un branch tracciato, non lasciare il repo principale su un altro branch, e annotati file temporanei e processi che avvii (rami, worktree, stash e sessioni bg li registra la mod). Il primo `vertical_done` con status done non chiude: restituisce l\'inventario di ciò che hai creato tu e, a parte, ciò che non è tuo (non si tocca). Rispondi con `cleanup_plan` (ogni voce tua tenere/rimuovere con motivo, più file temporanei e processi), aspetta l\'approvazione della madre, esegui la pulizia, poi richiama con `cleanup_report`. La mod rifà l\'inventario e rifiuta se resta qualcosa di tuo non previsto. La pulizia non si traccia su PACA.',
   ].filter(Boolean).join('\n')
 }
 
@@ -565,6 +781,8 @@ function rulesSection(v: Vertical | undefined): string {
 let clearedFrom: string | undefined
 // The hub row the focus ring is on: the target of the a/h/s/x hotkeys.
 let selected: string | undefined
+// Cleanup plans already put to the person, so the poll asks once each.
+const asked = new Set<string>()
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -593,13 +811,28 @@ export const register: Register = on => {
     await $.tool.register({
       name: TOOL_DONE,
       description:
-        'Chiude (o mette in pausa) questa chat verticale: salva il riepilogo nel brief e lo invia alla chat madre. Usalo a lavoro concluso.',
+        'Chiude (o mette in pausa) questa chat verticale: salva il riepilogo nel brief e lo invia alla chat madre. Usalo a lavoro concluso. ' +
+        'Con status done passa da un gate di pulizia: la prima chiamata restituisce l\'inventario, poi serve cleanup_plan approvato dalla madre, la pulizia e cleanup_report.',
       isDeferred: false,
       inputSchema: {
         type: 'object',
         properties: {
           summary: { type: 'string', description: 'Cosa è stato fatto, file/commit, deploy sì/no, cosa resta aperto.' },
           status: { type: 'string', enum: ['done', 'paused'] },
+          cleanup_plan: {
+            type: 'array',
+            description: 'Piano di pulizia (solo per done, dopo l\'inventario): ogni voce dell\'inventario più file temporanei e processi, ciascuna da tenere o rimuovere con il motivo.',
+            items: {
+              type: 'object',
+              properties: {
+                item: { type: 'string', description: 'Testo della voce, identico a quello dell\'inventario.' },
+                action: { type: 'string', enum: ['keep', 'remove'] },
+                reason: { type: 'string' },
+              },
+              required: ['item', 'action', 'reason'],
+            },
+          },
+          cleanup_report: { type: 'string', description: 'Cosa hai pulito, dopo l\'approvazione del piano.' },
         },
         required: ['summary'],
       },
@@ -632,6 +865,14 @@ export const register: Register = on => {
           const fresh = await refresh($)
           if (fresh.changed) changed = true
           await adoptOrphans($, fresh.state.live)
+          const id = await $.session.id()
+          for (const v of list) {
+            if (v.cleanupStatus !== 'pending') asked.delete(v.sessionId)
+            else if (v.parentSessionId === id && !asked.has(v.sessionId)) {
+              asked.add(v.sessionId)
+              void answerCleanup($, v).catch(() => undefined)
+            }
+          }
         }
         if (changed) await bump($)
       })().catch(() => undefined)
@@ -682,9 +923,32 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'mcp__chat-verticali__vertical_done' }, async ($, e) => {
-    const input = e as unknown as { summary: string; status?: 'done' | 'paused' }
+    const input = e as unknown as DoneInput
     return { result: await finishVertical($, input) }
   })
+
+  // A vertical notes what it creates, so its cleanup touches only its own mess:
+  // files its edits leave, and what a Bash or EnterWorktree call adds to the repo.
+  on('tool.call', { tool: /^(Edit|Write|NotebookEdit)$/ }, async ($, e, next) => {
+    const ran = await next(e)
+    const v = await thisVertical($)
+    const input = e as unknown as { file_path?: string; notebook_path?: string }
+    const path = input.file_path ?? input.notebook_path
+    if (v && path && ran.deny === undefined) {
+      const files = [...new Set([...(v.created?.files ?? []), path])]
+      if (files.length !== (v.created?.files ?? []).length) await $.store.set(verticalKey(v.sessionId), { ...v, created: { ...v.created, files } })
+    }
+    return ran
+  }).catch(($, e, next) => next(e))
+
+  on('tool.call', { tool: /^(Bash|EnterWorktree)$/ }, async ($, e, next) => {
+    const v = await thisVertical($)
+    if (!v) return next(e)
+    const before = await repoState($, v)
+    const ran = await next(e)
+    await noteCreated($, v, before, await repoState($, v), JSON.stringify(ran.result ?? ''))
+    return ran
+  }).catch(($, e, next) => next(e))
 
   // Trigger: a different PACA task changes status in this chat.
   on('tool.call', { tool: /^mcp__paca(-[\w-]+)?__update_task$/ }, async ($, e, next) => {
@@ -875,6 +1139,11 @@ export const register: Register = on => {
             </Text>
           )}
           {!compact && lastAt && <Text dimColor> {ago(now - Date.parse(lastAt))}</Text>}
+          {v.cleanupStatus === 'pending' && v.parentSessionId === currentId && (
+            <Box marginLeft={1}>
+              <Button key={`cleanup-${v.sessionId}`} label="Pulizia" variant="primary" onPress={() => void answerCleanup($, v).catch(() => undefined)} />
+            </Box>
+          )}
           {!self && v.agentId && windows[v.sessionId] && (
             <Box marginLeft={1}>
               <Button key={`hide-${v.sessionId}`} label="Nascondi" dimColor onPress={() => void hide($, v)} />

@@ -13,6 +13,7 @@ export type PanelVertical = {
   contextPercent?: number
   // Short id of the background session (v1.0); absent on v0.3 interactive verticals.
   agentId?: string
+  cleanupStatus?: 'pending' | 'approved'
 }
 
 // One entry of `claude agents --json`.
@@ -26,6 +27,7 @@ export type Live = {
   state?: string
   pid?: number
   cwd?: string
+  startedAt?: number
 }
 
 export const DONE_SHOWN = 5
@@ -69,11 +71,12 @@ export const ago = (ms: number) => {
 }
 
 // What a vertical asks of the person, most urgent first.
-export const ATTENTION = ['ask', 'input', 'busy', 'open', 'hidden', 'paused', 'done'] as const
+export const ATTENTION = ['ask', 'cleanup', 'input', 'busy', 'open', 'hidden', 'paused', 'done'] as const
 export type Attention = (typeof ATTENTION)[number]
 
 export function attention(v: PanelVertical, live: Live | undefined, hasWindow: boolean): Attention {
   if (v.status === 'done') return 'done'
+  if (v.cleanupStatus === 'pending') return 'cleanup'
   if (live?.waitingFor && /permission|dialog/i.test(live.waitingFor)) return 'ask'
   if (live?.status === 'waiting' || live?.waitingFor || live?.state === 'blocked') return 'input'
   if (live?.status === 'busy' || live?.state === 'working') return 'busy'
@@ -86,6 +89,7 @@ type Glyph = { glyph: string; color?: string; dim: boolean; label: string }
 
 export const GLYPHS: Record<Attention, Glyph> = {
   ask: { glyph: '?', color: 'red', dim: false, label: 'permesso o domanda' },
+  cleanup: { glyph: '⌫', color: 'magenta', dim: false, label: 'pulizia da approvare' },
   input: { glyph: '◆', color: 'yellow', dim: false, label: 'input richiesto' },
   busy: { glyph: '●', color: 'green', dim: false, label: 'al lavoro' },
   open: { glyph: '○', dim: false, label: 'aperta, ferma' },
