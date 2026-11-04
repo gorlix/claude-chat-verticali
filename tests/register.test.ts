@@ -523,7 +523,7 @@ test('the hub adopts the open children and the inbox of a mother that is gone', 
 // A vertical in /repo on main; `git` answers from `repo`, which a test changes.
 const gateSetup = (on: Parameters<typeof mock.store>[0], over: object = {}) => {
   // `dirty` holds raw `git status --porcelain -z` entries; `gitCalls` counts git runs.
-  const repo = { branches: ['main', 'old'], dirty: [] as string[], head: 'main', stashes: [] as string[], gitCalls: 0, broken: false }
+  const repo = { branches: ['main', 'old'], dirty: [] as string[], head: 'main', stashes: [] as string[], worktrees: [] as string[], live: [] as object[], gitCalls: 0, broken: false }
   const data = spyStore(on, {
     'v:a': v('a', {
       cwd: '/repo', project: '/repo', parentSessionId: 'mother', briefPath: '/tmp/a.md',
@@ -543,8 +543,10 @@ const gateSetup = (on: Parameters<typeof mock.store>[0], over: object = {}) => {
   on('process.run', (_$, e) => {
     const argv = [...(e as { argv: string[] }).argv]
     const out = (stdout: string) => ({ value: { ...runOk, stdout } })
+    if (argv[0] === 'claude' && argv[1] === 'agents') return out(JSON.stringify(repo.live))
     if (argv[0] !== 'git') return out('')
     repo.gitCalls++
+    if (argv[1] === 'worktree') return out(['/repo', ...repo.worktrees].map(w => `worktree ${w}`).join('\n'))
     if (argv[1] === 'rev-parse') return out(argv.includes('--show-toplevel') ? '/repo\n' : '/repo/.git\n')
     if (argv[1] === 'status') return out(repo.dirty.map(d => `${d}\0`).join(''))
     if (argv[1] === 'branch') return out(`${repo.head}\n`)
@@ -686,7 +688,7 @@ test('a file already modified at the start is never mine, even when the vertical
 })
 
 test('dirty paths come from the work tree root: subfolder cwd, untracked folders, renames, spaces', async ($, on) => {
-  const { repo } = gateSetup(on, { cwd: '/repo/sub', created: { files: ['/repo/newdir/x.ts', '/repo/new name.ts'] } })
+  const { repo } = gateSetup(on, { cwd: '/repo/sub', created: { files: ['/repo/newdir/', '/repo/new name.ts'] } })
   repo.dirty.push('?? newdir/', 'R  new name.ts', 'old.ts', ' M sub/a.ts')
   const text = String((await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)).result)
   const [mine, others] = text.split('Non attribuibili')
@@ -751,4 +753,33 @@ test('a mother that is itself a vertical approves its child\'s plan when no hub 
   await clock.advance(3000)
   expect(questions).toHaveLength(1)
   expect(data.get('v:x')).toMatchObject({ cleanupStatus: 'approved' })
+})
+
+test('a folder wider than my files is not mine; a folder I made is', async ($, on) => {
+  const { repo } = gateSetup(on, { created: { files: ['/repo/a/b/f.ts', '/repo/mia/'] } })
+  repo.dirty.push('?? a/', '?? mia/')
+  const text = String((await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)).result)
+  const [mine, others] = text.split('Non attribuibili')
+  expect(mine).toContain('git-modifica:/repo/mia/')
+  expect(mine).not.toContain('git-modifica:/repo/a/')
+  expect(others).toContain('git-modifica:/repo/a/ (contiene file creati da me: rimuovi solo quelli)')
+})
+
+test('with a live hub, a vertical with no mother does not ask itself: one question only', async ($, on) => {
+  const { data, repo } = gateSetup(on, { parentSessionId: undefined })
+  data.set('hub:/repo', 'h')
+  repo.live.push({ sessionId: 'h', id: 'hh' })
+  let asked = 0
+  on('tool.call', { tool: 'AskUserQuestion' }, () => ({ result: { answers: { q: void asked++ } } }))
+  const ran = await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok', cleanup_plan: [] } as never)
+  expect(String(ran.result)).toContain("inviato all'hub")
+  expect(asked).toBe(0)
+  expect(data.get('v:a')).toMatchObject({ cleanupStatus: 'pending' })
+})
+
+test('EnterWorktree records the worktree it creates', async ($, on) => {
+  const { data, repo } = gateSetup(on)
+  on('tool.call', { tool: 'EnterWorktree' }, () => ({ result: void repo.worktrees.push('/repo/.claude/worktrees/x') }))
+  await $.tool.call({ tool: 'EnterWorktree', name: 'x' } as never)
+  expect(data.get('v:a')).toMatchObject({ created: { worktrees: ['/repo/.claude/worktrees/x'] } })
 })

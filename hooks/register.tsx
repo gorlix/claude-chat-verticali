@@ -419,9 +419,14 @@ async function dirtyOf($: EngineInterface, dir: string): Promise<string[]> {
   return found
 }
 
-// A path is covered by a list when it is in it or under one of its folders.
-const covers = (list: readonly string[] | undefined, path: string) =>
-  Boolean(list?.some(p => p === path || (p.endsWith('/') && path.startsWith(p)) || (path.endsWith('/') && p.startsWith(path))))
+// A path is within a list when it is in it or under one of its folders.
+const within = (list: readonly string[] | undefined, path: string) =>
+  Boolean(list?.some(p => p === path || (p.endsWith('/') && path.startsWith(p))))
+// A folder path holds something of the list.
+const holds = (list: readonly string[] | undefined, path: string) =>
+  path.endsWith('/') && Boolean(list?.some(p => p !== path && p.startsWith(path)))
+// Either way: for what was dirty at the start, the careful reading.
+const overlaps = (list: readonly string[] | undefined, path: string) => within(list, path) || holds(list, path)
 
 // The repo as a Bash call may change it: branches, worktrees, stashes, the
 // main checkout's branch, the files left modified. All at once.
@@ -488,7 +493,7 @@ async function noteCreated($: EngineInterface, v: Vertical, before: RepoState, a
     branches: fresh_(after.branches, before.branches),
     worktrees: fresh_(after.worktrees, before.worktrees),
     stashes: fresh_(after.stashes.map(hash), before.stashes.map(hash)),
-    files: fresh_(after.dirty, before.dirty).filter(f => !covers(v.startDirty, f)),
+    files: fresh_(after.dirty, before.dirty).filter(f => !overlaps(v.startDirty, f)),
     sessions: [...output.matchAll(/backgrounded\s+·\s+([\w-]+)/g)].map(m => m[1]),
   }, after.head !== before.head ? after.head !== (v.startBranch ?? after.head) : undefined)
 }
@@ -504,8 +509,11 @@ async function inventory($: EngineInterface, vertical: Vertical): Promise<{ mine
   const others: string[] = []
   const put = (isMine: boolean | undefined, item: string) => (isMine ? mine : others).push(item)
   for (const f of now.dirty) {
-    if (covers(v.startDirty, f)) others.push(`git-modifica:${f} (già modificato all'avvio)`)
-    else put(covers(c.files, f), `git-modifica:${f}`)
+    if (overlaps(v.startDirty, f)) others.push(`git-modifica:${f} (già modificato all'avvio)`)
+    else if (within(c.files, f)) mine.push(`git-modifica:${f}`)
+    // A folder wider than what this vertical made: not its to remove whole.
+    else if (holds(c.files, f)) others.push(`git-modifica:${f} (contiene file creati da me: rimuovi solo quelli)`)
+    else others.push(`git-modifica:${f}`)
   }
   if (v.startBranch && now.head && now.head !== v.startBranch) put(c.head, `git-repo-principale-su:${now.head} (partenza ${v.startBranch})`)
   const knownWt = new Set(v.startWorktrees ?? [])
@@ -584,7 +592,9 @@ async function cleanupGate($: EngineInterface, vertical: Vertical, input: DoneIn
   const notMine = input.cleanup_plan.filter(p => p.action === 'remove' && others.includes(p.item)).map(p => p.item)
   if (notMine.length) return `Il piano rimuove voci non attribuibili a questa verticale (non tue, non si toccano):\n${bullet(notMine)}\nToglile dal piano e rimandalo.`
   await save({ cleanupStatus: 'pending', cleanupPlan: input.cleanup_plan, cleanupNote: undefined })
-  if (!v.parentSessionId) {
+  // Asked here only when no one else approves: one question, never two.
+  const by = await approval($, v)
+  if (!by.id || by.id === v.sessionId) {
     const answer = await askCleanup($, { ...v, cleanupStatus: 'pending', cleanupPlan: input.cleanup_plan })
     if (!answer) return 'Domanda chiusa senza risposta: il piano resta in attesa. Richiama vertical_done con cleanup_plan per riproporla.'
     return answer === 'Approva'
@@ -592,7 +602,7 @@ async function cleanupGate($: EngineInterface, vertical: Vertical, input: DoneIn
       : `Piano non approvato${answer === 'Rifiuta' ? '' : `: ${answer}`}. Correggilo e rimanda cleanup_plan.`
   }
   await bump($)
-  return 'Piano di pulizia inviato alla chat madre per l\'approvazione. Aspetta la risposta (arriva come messaggio): non chiudere e non pulire ancora.'
+  return `Piano di pulizia inviato ${by.isHub ? 'all\'hub' : 'alla chat madre'} per l'approvazione. Aspetta la risposta (arriva come messaggio): non chiudere e non pulire ancora.`
 }
 
 // Plans with a question open now, and plans the poll already put once.
@@ -602,9 +612,12 @@ const asked = new Set<string>()
 // Who approves a vertical's plan: the project's hub while it runs (it adopts
 // every mother's children), else the vertical's mother, vertical or not.
 async function approverOf($: EngineInterface, v: Vertical): Promise<string | undefined> {
+  return (await approval($, v)).id
+}
+async function approval($: EngineInterface, v: Vertical): Promise<{ id?: string; isHub: boolean }> {
   const hub = (await $.store.get(hubKey(v.project ?? (await projectOf($, v.cwd))))) as string | undefined
-  if (hub && hub !== v.sessionId && (await listAgents($)).some(a => a.sessionId === hub)) return hub
-  return v.parentSessionId
+  if (hub && hub !== v.sessionId && (await listAgents($)).some(a => a.sessionId === hub)) return { id: hub, isHub: true }
+  return { id: v.parentSessionId, isHub: false }
 }
 
 // Asks the person to approve a vertical's cleanup plan; writes the answer on
@@ -1017,7 +1030,7 @@ export const register: Register = on => {
       const path = input.file_path ?? input.notebook_path
       if (v && path && ran.deny === undefined) {
         const based = await withBaseline($, v)
-        if (!covers(based.startDirty, path)) await addCreated($, based, { files: [path] })
+        if (!overlaps(based.startDirty, path)) await addCreated($, based, { files: [path] })
       }
     } catch {
       // Not recorded: the file counts as not this vertical's, so it is left alone.
