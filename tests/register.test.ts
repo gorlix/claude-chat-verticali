@@ -978,3 +978,14 @@ test('outside tmux and zellij, with zellij missing, handoff only starts the back
   expect(ran.result).toContain('claude attach aa11bb22')
   expect(runs.some(r => r[4] === 'new-tab')).toBe(false)
 })
+
+test('a pending plan tells the vertical how to re-check, and an approval saved while it waited closes it', async ($, on) => {
+  const { data } = bgDone(on)
+  data.set('v:a', { ...(data.get('v:a') as object), cleanupStatus: 'pending' })
+  const waiting = await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)
+  expect(String(waiting.result)).toContain('senza cleanup_plan')
+  // The approval lands in the record (its message lost): the next call closes.
+  data.set('v:a', { ...(data.get('v:a') as object), cleanupStatus: 'approved', cleanupPlan: [] })
+  await $.tool.call({ tool: 'mcp__chat-verticali__vertical_done', summary: 'ok' } as never)
+  expect(data.get('v:a')).toMatchObject({ status: 'done' })
+})

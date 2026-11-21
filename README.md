@@ -1,6 +1,6 @@
 # chat-verticali
 
-Una mod di Claude Code (plugin con hooks module TypeScript) per lavorare a "chat verticali": una chat per ogni task PACA, argomento o funzione di un repo. Quando il lavoro cambia verticale, o il contesto si riempie, la chat corrente passa il testimone a una nuova chat con un brief scritto per bastare da solo; a lavoro finito la nuova chat riporta il risultato alla chat madre. Versione 1.2.0.
+Una mod di Claude Code (plugin con hooks module TypeScript) per lavorare a "chat verticali": una chat per ogni task PACA, argomento o funzione di un repo. Quando il lavoro cambia verticale, o il contesto si riempie, la chat corrente passa il testimone a una nuova chat con un brief scritto per bastare da solo; a lavoro finito la nuova chat riporta il risultato alla chat madre. Versione 1.2.1.
 
 Nasce da un'abitudine pratica: una chat lunga e che salta tra più cose si degrada. Meglio chat corte e mirate, e un passaggio di consegne esplicito.
 
