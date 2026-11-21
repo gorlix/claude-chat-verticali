@@ -187,11 +187,14 @@ const zellij = ($: EngineInterface, session: string, ...action: string[]) =>
   $.process.run(['zellij', '--session', session, 'action', ...action])
 
 // Where this chat runs. Both set (one inside the other): tmux, as before.
+// A background vertical has neither: it opens its children where its own
+// window lives (the multiplexer its record keeps).
 async function muxDetect($: EngineInterface): Promise<Mux | undefined> {
   if (await $.env.get('TMUX')) return { kind: 'tmux' }
   const session = await $.env.get('ZELLIJ_SESSION_NAME')
   if ((await $.env.get('ZELLIJ')) !== undefined && session) return { kind: 'zellij', session }
-  return undefined
+  const own = (await thisVertical($))?.mux
+  return own && (own.kind === 'tmux' || own.session) ? { kind: own.kind, session: own.session } : undefined
 }
 
 // Opens a window running `claude attach <agentId>`; returns what to remember of it.
@@ -239,14 +242,15 @@ async function muxWindows($: EngineInterface, records: { sessionId: string; agen
   for (const [session, list] of bySession) {
     const ran = await zellij($, session, 'list-panes', '-j', '-t', '-c').catch(() => undefined)
     if (!ran || ran.exitCode !== 0) continue
-    let panes: { is_plugin: boolean; tab_id: number; pane_command?: string }[]
+    let panes: { is_plugin: boolean; tab_id: number; pane_command?: string; terminal_command?: string }[]
     try {
       panes = JSON.parse(ran.stdout)
     } catch {
       continue
     }
     for (const r of list) {
-      const ours = panes.some(p => !p.is_plugin && p.tab_id === r.tabId && p.pane_command?.includes(`attach ${r.agentId}`))
+      // A tab zellij restored after a restart waits for Enter: no pane_command, the terminal_command stays.
+      const ours = panes.some(p => !p.is_plugin && p.tab_id === r.tabId && (p.pane_command ?? p.terminal_command)?.includes(`attach ${r.agentId}`))
       if (ours) found[r.sessionId] = zellijHandle({ session, tabId: r.tabId })
     }
   }
@@ -379,10 +383,9 @@ async function openWindow($: EngineInterface, v: Vertical): Promise<boolean> {
   if (!v.agentId || !here) return false
   const opened = await muxOpen($, here, windowName(v.title, v.pacaRef), v.cwd, v.agentId, v.sessionId)
   if (!opened) return false
-  if (opened.kind === 'zellij') {
-    Object.assign(v, { mux: opened })
-    await $.store.set(verticalKey(v.sessionId), v)
-  }
+  // Kept for tmux too: a background vertical opens its children with it.
+  Object.assign(v, { mux: opened })
+  await $.store.set(verticalKey(v.sessionId), v)
   return true
 }
 
@@ -895,8 +898,11 @@ async function goTo($: EngineInterface, v: Vertical) {
     await $.ui.copy({ text: command })
     $.ui.toast(`${why}: copiato "${command}"`)
   }
-  if (!(await muxDetect($))) return offer('Fuori da tmux/zellij')
+  const here = await muxDetect($)
+  if (!here) return offer('Fuori da tmux/zellij')
   if (!v.agentId) {
+    // A v0.3 vertical lives in a tmux window found by slug; zellij has none.
+    if (here.kind === 'zellij') return offer('Verticale v0.3, senza tab zellij')
     const ran = await $.process.run(['tmux', 'select-window', '-t', v.slug])
     if (ran.exitCode !== 0) await offer(`Finestra «${v.slug}» non trovata`)
     return

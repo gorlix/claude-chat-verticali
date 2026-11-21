@@ -884,3 +884,52 @@ test('zellij reuses tab ids: a stranger tab on the saved id is never touched, th
   expect(runs.filter(r => r[4] === 'close-tab-by-id' || r[4] === 'go-to-tab-by-id')).toEqual([])
   expect(runs.filter(r => r[4] === 'new-tab')).toHaveLength(1)
 })
+
+test('a background vertical (no zellij env) opens its child in the tab session its record keeps', async ($, on) => {
+  const data = spyStore(on, { 'v:p': v('p', { agentId: 'pp', parentSessionId: 'main', mux: { kind: 'zellij', session: 'zs', tabId: 2 } }) })
+  const runs: string[][] = []
+  mock.clock(on, { now: 1_760_000_000_000 })
+  on('session.id', () => ({ value: 'p' }))
+  on('env.get', (_$, e) => ({ value: (e as { name: string }).name === 'HOME' ? '/home/x' : undefined }))
+  on('fs.write', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  sayYes(on)
+  here(on, '/tmp', zRun([{ sessionId: 'uuid-2', id: 'cd34ef56', name: 'y' }], {}, runs,
+    argv => argv[1] === '--bg' ? { ...runOk, stdout: 'backgrounded · cd34ef56 · y\n' } : argv[4] === 'new-tab' ? { ...runOk, stdout: '9\n' } : undefined))
+  const ran = await $.tool.call({ tool: 'mcp__chat-verticali__handoff', slug: 'y', title: 'Titolo y', scope: 's', brief: 'b' } as never)
+  expect(ran.result).toContain('aperta nella tab zellij')
+  expect(runs).toContainEqual(['zellij', '--session', 'zs', 'action', 'new-tab', '-n', 'Titolo y', '-c', '/tmp', '--close-on-exit', '--', 'claude', 'attach', 'cd34ef56'])
+  expect(data.get('v:uuid-2')).toMatchObject({ mux: { kind: 'zellij', session: 'zs', tabId: 9 } })
+  expect(runs.some(r => r[0] === 'tmux' && r[1] === 'new-window')).toBe(false)
+})
+
+test('a tab zellij restored after a restart (no pane_command, only terminal_command) still counts as open', async ($, on) => {
+  const runs: string[][] = []
+  mock.store(on, { 'v:a': v('a', { agentId: 'aa', parentSessionId: 'main', mux: { kind: 'zellij', session: 'zs', tabId: 5 } }) })
+  on('session.id', () => ({ value: 'main' }))
+  on('env.get', (_$, e) => ({ value: zellijEnv((e as { name: string }).name) }))
+  here(on, '/tmp', hubRun([{ sessionId: 'a', id: 'aa', status: 'idle' }], {}, runs, argv =>
+    argv[0] === 'zellij' && argv[4] === 'list-panes'
+      ? { ...runOk, stdout: JSON.stringify([{ id: 21, is_plugin: false, tab_id: 5, is_held: true, terminal_command: 'claude attach aa' }]) }
+      : runOk))
+  const ui = await $.ui.mount(widePane)
+  expect(await ui.findAll({ type: 'Button', key: 'hide-a' })).toHaveLength(1)
+})
+
+test('in zellij a v0.3 vertical (no agent id) never calls tmux: Vai copies the resume command', async ($, on) => {
+  const runs: string[][] = []
+  const copied: string[] = []
+  mock.store(on, { 'v:a': v('a', { parentSessionId: 'main' }) })
+  on('session.id', () => ({ value: 'main' }))
+  on('env.get', (_$, e) => ({ value: zellijEnv((e as { name: string }).name) }))
+  on('ui.copy', (_$, e) => {
+    copied.push((e as { text: string }).text)
+    return { value: undefined }
+  })
+  on('ui.toast', () => ({ value: undefined }))
+  here(on, '/tmp', zRun([{ sessionId: 'a', status: 'idle' }], {}, runs))
+  const ui = await $.ui.mount(widePane)
+  await ui.press({ key: 'go-a' })
+  expect(runs.some(r => r[0] === 'tmux' && r[1] === 'select-window')).toBe(false)
+  expect(copied).toEqual(['claude --resume a'])
+})
