@@ -701,7 +701,10 @@ async function cleanupGate($: EngineInterface, vertical: Vertical, input: DoneIn
     )
   }
   if (v.cleanupStatus === 'pending' && !input.cleanup_plan) {
-    return 'Piano di pulizia in attesa di approvazione dalla chat madre: aspetta la risposta, non chiudere e non pulire ancora.'
+    return (
+      'Piano di pulizia in attesa di approvazione: aspetta la risposta, non chiudere e non pulire ancora. ' +
+      'Se la risposta non arriva, richiama vertical_done (status done) senza cleanup_plan: la mod legge lo stato dal registro.'
+    )
   }
   if (!input.cleanup_plan) {
     return [
@@ -738,7 +741,7 @@ async function cleanupGate($: EngineInterface, vertical: Vertical, input: DoneIn
       : `Piano non approvato${answer === 'Rifiuta' ? '' : `: ${answer}`}. Correggilo e rimanda cleanup_plan.`
   }
   await bump($)
-  return `Piano di pulizia inviato ${by.isHub ? 'all\'hub' : 'alla chat madre'} per l'approvazione. Aspetta la risposta (arriva come messaggio): non chiudere e non pulire ancora.`
+  return `Piano di pulizia inviato ${by.isHub ? 'all\'hub' : 'alla chat madre'} per l'approvazione. Aspetta la risposta (arriva come messaggio): non chiudere e non pulire ancora. Se non arriva, richiama vertical_done (status done) senza cleanup_plan: la mod legge lo stato dal registro.`
 }
 
 // Plans with a question open now, and plans the poll already put once.
@@ -793,7 +796,9 @@ async function answerCleanup($: EngineInterface, v: Vertical) {
   const text = answer === 'Approva'
     ? '[chat-verticali] Piano di pulizia approvato dall\'utente: eseguilo ora, poi chiama vertical_done (status done) con cleanup_report.'
     : `[chat-verticali] Piano di pulizia ${answer === 'Rifiuta' ? 'rifiutato' : `da modificare: ${answer}`}. Correggilo e richiama vertical_done con un nuovo cleanup_plan.`
-  await $.session.send({ to: { sessionId: v.sessionId }, text })
+  const sent = await $.session.send({ to: { sessionId: v.sessionId }, text }).catch(() => ({ isDelivered: false }))
+  // The answer is in the record anyway: the vertical reads it on its next vertical_done.
+  if (!sent.isDelivered) $.ui.toast(`«${v.slug}» non raggiungibile: risposta salvata, la vedrà al prossimo vertical_done`)
 }
 
 async function finishVertical(
