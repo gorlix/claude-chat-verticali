@@ -1,6 +1,6 @@
 # chat-verticali
 
-Una mod di Claude Code (plugin con hooks module TypeScript) per lavorare a "chat verticali": una chat per ogni task PACA, argomento o funzione di un repo. Quando il lavoro cambia verticale, o il contesto si riempie, la chat corrente passa il testimone a una nuova chat con un brief scritto per bastare da solo; a lavoro finito la nuova chat riporta il risultato alla chat madre. Versione 1.1.0.
+Una mod di Claude Code (plugin con hooks module TypeScript) per lavorare a "chat verticali": una chat per ogni task PACA, argomento o funzione di un repo. Quando il lavoro cambia verticale, o il contesto si riempie, la chat corrente passa il testimone a una nuova chat con un brief scritto per bastare da solo; a lavoro finito la nuova chat riporta il risultato alla chat madre. Versione 1.2.0.
 
 Nasce da un'abitudine pratica: una chat lunga e che salta tra più cose si degrada. Meglio chat corte e mirate, e un passaggio di consegne esplicito.
 
@@ -119,7 +119,10 @@ Dalla 1.1 la mod lavora anche in zellij (**0.45.1 verificato**: servono le azion
 - zellij non ha opzioni sulle tab: l'id della tab è salvato nel record della verticale (`mux: { kind, session, tabId }`) e l'hub la considera aperta solo se `list-panes -j -t -c` mostra in quella tab un pane non plugin con `claude attach <id>` (zellij riusa gli id delle tab liberate: una tab estranea sullo stesso id non si tocca mai).
 - `--close-on-exit`: uscire da `claude attach` (←) chiude la tab, come Nascondi; la sessione resta viva.
 - La chiusura a `done` parte dalla sessione in background, che non ha `$ZELLIJ`: usa `zellij --session <sessione del record> action ...`.
-- Limite: le tab si rilevano solo nella sessione zellij in cui sono state aperte. La mod non crea sessioni zellij né tocca `config.kdl`.
+- Una verticale in background non ha `$ZELLIJ`: le sue figlie si aprono nella sessione zellij (o in tmux) salvata nel suo record.
+- Dopo un riavvio zellij ripristina le tab con il comando in attesa di Invio: la tab si riconosce da `terminal_command` (`pane_command` è vuoto) e con Invio `claude attach` riparte.
+- **Fuori da tmux e zellij**: se `zellij` c'è, la mod crea (o ripristina) in background una sessione zellij chiamata come la cartella del progetto (`zellij attach --create-background <nome>`), ci apre la tab della verticale e copia negli appunti `zellij attach <nome>` per entrarci. Senza zellij la verticale parte solo in background (`claude attach <id>`).
+- Limite: le tab si rilevano solo nella sessione zellij in cui sono state aperte. La mod non tocca `config.kdl`.
 
 ## Flusso: madre, verticale, ritorno
 
