@@ -197,6 +197,27 @@ async function muxDetect($: EngineInterface): Promise<Mux | undefined> {
   return own && (own.kind === 'tmux' || own.session) ? { kind: own.kind, session: own.session } : undefined
 }
 
+// Outside any multiplexer: a background zellij session named after the project
+// (created, or resurrected, when missing). Undefined when zellij is not there.
+async function muxEnsure($: EngineInterface, cwd: string): Promise<Mux | undefined> {
+  const here = await muxDetect($)
+  if (here) return here
+  const name = (await projectOf($, cwd)).split('/').filter(Boolean).pop()?.replace(/[^\w.-]/g, '-') || 'claude'
+  // Fails with "Session already exists" when it runs: fine, the check below decides.
+  await $.process.run(['zellij', 'attach', '--create-background', name]).catch(() => undefined)
+  const ls = await $.process.run(['zellij', 'list-sessions', '-s']).catch(() => undefined)
+  if (!ls || ls.exitCode !== 0 || !ls.stdout.split('\n').some(l => l.trim() === name)) return undefined
+  return { kind: 'zellij', session: name }
+}
+
+// Outside zellij the tab sits in a session the person has not entered yet.
+async function enterHint($: EngineInterface, mux?: Mux): Promise<string> {
+  if (!mux?.session || (await muxDetect($))) return ''
+  const command = `zellij attach ${mux.session}`
+  await $.ui.copy({ text: command }).catch(() => undefined)
+  return ` Sei fuori da zellij: entra con \`${command}\` (copiato).`
+}
+
 // Opens a window running `claude attach <agentId>`; returns what to remember of it.
 async function muxOpen(
   $: EngineInterface, mux: Mux, name: string, cwd: string, agentId: string, sessionId: string,
@@ -378,18 +399,18 @@ async function launch($: EngineInterface, v: Vertical): Promise<{ agentId: strin
 
 // Opens a window (tmux window / zellij tab) attached to the vertical (by id,
 // never by name: attach also takes part of a name), tagged to find it again.
-async function openWindow($: EngineInterface, v: Vertical): Promise<boolean> {
-  const here = v.agentId ? await muxDetect($) : undefined
-  if (!v.agentId || !here) return false
+async function openWindow($: EngineInterface, v: Vertical): Promise<Mux | undefined> {
+  const here = v.agentId ? await muxEnsure($, v.cwd) : undefined
+  if (!v.agentId || !here) return undefined
   const opened = await muxOpen($, here, windowName(v.title, v.pacaRef), v.cwd, v.agentId, v.sessionId)
-  if (!opened) return false
+  if (!opened) return undefined
   // Kept for tmux too: a background vertical opens its children with it.
   Object.assign(v, { mux: opened })
   await $.store.set(verticalKey(v.sessionId), v)
-  return true
+  return opened
 }
 
-const muxLabel = async ($: EngineInterface) => ((await muxDetect($))?.kind === 'zellij' ? 'tab zellij' : 'finestra tmux')
+const muxLabel = (mux?: Mux) => (mux?.kind === 'zellij' ? 'tab zellij' : 'finestra tmux')
 
 const attachCommand = (v: Vertical) => (v.agentId ? `claude attach ${v.agentId}` : `claude --resume ${v.sessionId}`)
 
@@ -415,7 +436,7 @@ async function startHandoff($: EngineInterface, input: HandoffInput): Promise<st
     const opened = await openWindow($, existing)
     return (
       `Chat verticale «${existing.slug}» non raggiungibile: aggiornamento aggiunto al brief ${existing.briefPath}. ` +
-      (opened ? `Riaperta in una ${await muxLabel($)}.` : `Riaprila con \`${attachCommand(existing)}\`.`)
+      (opened ? `Riaperta in una ${muxLabel(opened)}.${await enterHint($, opened)}` : `Riaprila con \`${attachCommand(existing)}\`.`)
     )
   }
 
@@ -453,10 +474,10 @@ async function startHandoff($: EngineInterface, input: HandoffInput): Promise<st
   void openPane($).catch(() => undefined)
   const opened = await openWindow($, v)
   const where = opened
-    ? `avviata in background e aperta nella ${await muxLabel($)} «${windowName(v.title, v.pacaRef)}»`
+    ? `avviata in background e aperta nella ${muxLabel(opened)} «${windowName(v.title, v.pacaRef)}»${opened.session && !(await muxDetect($)) ? ` della sessione zellij «${opened.session}»` : ''}`
     : `avviata in background (\`claude attach ${v.agentId}\` per aprirla)`
   return (
-    `Chat verticale «${v.slug}» ${where}. Brief: ${v.briefPath}. ` +
+    `Chat verticale «${v.slug}» ${where}. Brief: ${v.briefPath}.${await enterHint($, opened)} ` +
     (v.pacaTaskId
       ? `Aggiungi ora un commento al task PACA ${v.pacaRef ?? v.pacaTaskId} che dice che il lavoro prosegue nella chat verticale «${v.slug}».`
       : '')
@@ -899,18 +920,25 @@ async function goTo($: EngineInterface, v: Vertical) {
     $.ui.toast(`${why}: copiato "${command}"`)
   }
   const here = await muxDetect($)
-  if (!here) return offer('Fuori da tmux/zellij')
   if (!v.agentId) {
     // A v0.3 vertical lives in a tmux window found by slug; zellij has none.
+    if (!here) return offer('Fuori da tmux/zellij')
     if (here.kind === 'zellij') return offer('Verticale v0.3, senza tab zellij')
     const ran = await $.process.run(['tmux', 'select-window', '-t', v.slug])
     if (ran.exitCode !== 0) await offer(`Finestra «${v.slug}» non trovata`)
     return
   }
+  // Outside zellij the tab opens (or is selected) in the project's session: say how to enter it.
+  const entered = async (mux?: Mux) => {
+    const hint = await enterHint($, mux)
+    if (hint) $.ui.toast(hint.trim())
+  }
   const win = (await taggedWindows($))[v.sessionId]
-  if (win && (await muxSelect($, win))) return
+  if (win && (await muxSelect($, win))) return entered(v.mux)
   if (v.status === 'paused') await $.store.set(verticalKey(v.sessionId), { ...v, status: 'active' })
-  if (!(await openWindow($, v))) return offer('Finestra non aperta')
+  const opened = await openWindow($, v)
+  if (!opened) return offer(here ? 'Finestra non aperta' : 'Fuori da tmux/zellij, e zellij non parte')
+  await entered(opened)
   await refresh($)
 }
 
